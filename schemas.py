@@ -945,3 +945,8 @@ class ChatNotificationSummaryResponse(BaseModel):
     last_message_text: str | None = None
     last_message_sender: str | None = None
     last_message_chat: str | None = None
+
+
+class PushTokenRegisterRequest(BaseModel):
+    token: str
+    platform: str = "android"

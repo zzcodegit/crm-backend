@@ -24,8 +24,10 @@ from models import (
     PrivateDialog,
     GroupChatDialog,
     GroupChatMember,
+    PushDeviceToken,
     User,
 )
+from push_service import send_push_to_tokens
 from schemas import (
     ChatAttachmentResponse,
     ChatEditMessageRequest,
@@ -37,6 +39,7 @@ from schemas import (
     GroupChatDialogCreateRequest,
     GroupChatMemberResponse,
     ChatNotificationSummaryResponse,
+    PushTokenRegisterRequest,
 )
 
 
@@ -191,6 +194,49 @@ def list_users_for_chat(
     ]
 
 
+def _register_or_update_push_token(db: Session, *, user_id: int, token: str, platform: str) -> None:
+    token = (token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Токен обязателен")
+    platform = (platform or "android").strip().lower()
+
+    existing_by_token = db.query(PushDeviceToken).filter(PushDeviceToken.token == token).first()
+    if existing_by_token:
+        existing_by_token.user_id = user_id
+        existing_by_token.platform = platform
+        existing_by_token.is_active = True
+    else:
+        db.add(PushDeviceToken(user_id=user_id, token=token, platform=platform, is_active=True))
+    db.commit()
+
+
+def _send_chat_push_to_users(db: Session, *, user_ids: list[int], title: str, body: str, data: dict[str, str]) -> None:
+    if not user_ids:
+        return
+    tokens = [
+        row.token
+        for row in db.query(PushDeviceToken)
+        .filter(PushDeviceToken.user_id.in_(user_ids), PushDeviceToken.is_active == True)
+        .all()
+    ]
+    send_push_to_tokens(tokens=tokens, title=title, body=body, data=data)
+
+
+@router.post("/push/register", status_code=204)
+def register_push_token(
+    payload: PushTokenRegisterRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _register_or_update_push_token(
+        db,
+        user_id=current_user.id,
+        token=payload.token,
+        platform=payload.platform,
+    )
+    return None
+
+
 # --- General chat ---
 
 
@@ -313,6 +359,19 @@ async def general_send(
 
     db.commit()
     db.refresh(msg)
+    recipients = [
+        m.user_id
+        for m in db.query(GeneralChatMember)
+        .filter(GeneralChatMember.is_active == True, GeneralChatMember.user_id != current_user.id)
+        .all()
+    ]
+    _send_chat_push_to_users(
+        db,
+        user_ids=recipients,
+        title="Новое сообщение (Общий чат)",
+        body=(text_val or "Вложение"),
+        data={"chatType": "general", "messageId": str(msg.id)},
+    )
     return _to_message_response(
         msg, 
         attachments=list(msg.attachments), 
@@ -498,6 +557,15 @@ async def private_send(
 
     db.commit()
     db.refresh(msg)
+    dialog = _require_dialog_access(db, current_user, dialog_id)
+    other_user_id = dialog.user2_id if dialog.user1_id == current_user.id else dialog.user1_id
+    _send_chat_push_to_users(
+        db,
+        user_ids=[other_user_id],
+        title=f"Новое сообщение ({user_display_name(current_user)})",
+        body=(text_val or "Вложение"),
+        data={"chatType": "private", "dialogId": str(dialog_id), "messageId": str(msg.id)},
+    )
     return _to_message_response(
         msg, 
         attachments=list(msg.attachments), 
@@ -814,6 +882,23 @@ async def group_send(
 
     db.commit()
     db.refresh(msg)
+    recipients = [
+        m.user_id
+        for m in db.query(GroupChatMember)
+        .filter(
+            GroupChatMember.dialog_id == dialog_id,
+            GroupChatMember.is_active == True,
+            GroupChatMember.user_id != current_user.id,
+        )
+        .all()
+    ]
+    _send_chat_push_to_users(
+        db,
+        user_ids=recipients,
+        title="Новое сообщение (Группа)",
+        body=(text_val or "Вложение"),
+        data={"chatType": "group", "dialogId": str(dialog_id), "messageId": str(msg.id)},
+    )
     return _to_message_response(
         msg, 
         attachments=list(msg.attachments), 
