@@ -92,6 +92,7 @@ def _serialize_pricelist_row(row: Any) -> dict[str, Any]:
         "hide_detail_link": bool(getattr(row, "hide_detail_link", False)),
         "hide_photo": bool(getattr(row, "hide_photo", False)),
         "enable_transposition_calc": bool(getattr(row, "enable_transposition_calc", False)),
+        "admin_only": bool(getattr(row, "admin_only", False)),
     }
 
 
@@ -151,7 +152,9 @@ def _snapshot_payload(db: Session) -> dict[str, Any]:
     assets: set[str] = set()
     for row in pricelist:
         assets.update(_collect_images(getattr(row, "photo_urls", None), getattr(row, "photo_url", None)))
-    for row in pricelist_rx:
+    # Как GET /api/pricelist-rx для не-админа: в APK только публичные позиции RX.
+    pricelist_rx_public = [x for x in pricelist_rx if not bool(getattr(x, "admin_only", False))]
+    for row in pricelist_rx_public:
         assets.update(_collect_images(getattr(row, "photo_urls", None), getattr(row, "photo_url", None)))
     for row in pricelist_mkl:
         assets.update(_collect_images(getattr(row, "photo_urls", None), getattr(row, "photo_url", None)))
@@ -227,7 +230,7 @@ def _snapshot_payload(db: Session) -> dict[str, Any]:
 
     snapshot_data = {
         "pricelist": [_serialize_pricelist_row(x) for x in pricelist],
-        "pricelist_rx": [_serialize_pricelist_row(x) for x in pricelist_rx],
+        "pricelist_rx": [_serialize_pricelist_row(x) for x in pricelist_rx_public],
         "pricelist_mkl": [_serialize_pricelist_row(x) for x in pricelist_mkl],
         "lens_catalog": manufacturers_payload,
         "manufacturers": manufacturers_payload,
