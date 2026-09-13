@@ -1,0 +1,20 @@
+[Unit]
+Description=CRM Backend FastAPI Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/crm-backend
+Environment="PATH=/home/crm-backend/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Снять «осиротевший» процесс на :8000 (ручной uvicorn / restart-backend.sh), иначе Errno 98 и nginx → 502.
+ExecStartPre=-/bin/sh -c '/usr/bin/fuser -k 8000/tcp 2>/dev/null || true'
+ExecStartPre=/bin/sleep 0.5
+ExecStart=/home/crm-backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+TimeoutStopSec=25
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

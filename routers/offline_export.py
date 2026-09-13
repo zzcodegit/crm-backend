@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session, joinedload
@@ -36,6 +39,29 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+_SIDEBAR_VIDEO_SETTINGS_PATH = Path(__file__).resolve().parent.parent / "logs" / "sidebar_video_settings.json"
+
+
+def _read_sidebar_video_settings() -> dict[str, Any]:
+    """Как GET /api/settings/sidebar-video — из того же JSON, что и main.py."""
+    try:
+        raw = _SIDEBAR_VIDEO_SETTINGS_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return {"video_url": None, "visible_group_ids": []}
+    vu_raw = data.get("video_url")
+    video_url = str(vu_raw).strip() if isinstance(vu_raw, str) and vu_raw.strip() else None
+    ids_raw = data.get("visible_group_ids")
+    visible_group_ids: list[int] = []
+    if isinstance(ids_raw, list):
+        for x in ids_raw:
+            try:
+                visible_group_ids.append(int(x))
+            except (TypeError, ValueError):
+                continue
+    return {"video_url": video_url, "visible_group_ids": visible_group_ids}
+
+
 def _collect_images(photo_urls: Any, photo_url: str | None) -> list[str]:
     out: list[str] = []
     if isinstance(photo_urls, list):
@@ -54,23 +80,109 @@ def _collect_images(photo_urls: Any, photo_url: str | None) -> list[str]:
 
 def _serialize_pricelist_row(row: Any) -> dict[str, Any]:
     manufacturer = getattr(row, "manufacturer", None)
+    manufacturer_country = getattr(getattr(manufacturer, "country", None), "name", None) if manufacturer else None
     images = _collect_images(getattr(row, "photo_urls", None), getattr(row, "photo_url", None))
     feature_ids = getattr(row, "feature_ids", None)
     feature_colors = getattr(row, "feature_colors", None)
     custom_values = getattr(row, "custom_values", None)
-    barcodes = getattr(row, "barcodes", None)
-    barcode_sections = getattr(row, "barcode_sections", None)
+    barcodes_raw = getattr(row, "barcodes", None)
+    barcode_sections_raw = getattr(row, "barcode_sections", None)
+    barcodes: list[dict[str, Any]] = []
+    barcode_sections: list[dict[str, Any]] = []
+    # Поддерживаем все форматы хранения:
+    # 1) legacy list[str]
+    # 2) list[{code, price, description}]
+    # 3) {"_v": 2, "sections": [{name, items:[...]}]}
+    if isinstance(barcodes_raw, dict):
+        sections_raw = barcodes_raw.get("sections")
+        if isinstance(sections_raw, list):
+            for sec in sections_raw:
+                if not isinstance(sec, dict):
+                    continue
+                items_raw = sec.get("items")
+                if not isinstance(items_raw, list):
+                    continue
+                entries: list[dict[str, Any]] = []
+                for it in items_raw:
+                    if isinstance(it, str):
+                        code = it.strip()
+                        if code:
+                            entries.append({"code": code, "price": None, "description": None})
+                    elif isinstance(it, dict):
+                        code = str(it.get("code") or "").strip()
+                        if code:
+                            entries.append(
+                                {
+                                    "code": code,
+                                    "price": _to_float(it.get("price")),
+                                    "description": str(it.get("description") or "").strip() or None,
+                                }
+                            )
+                if entries:
+                    barcode_sections.append({"name": str(sec.get("name") or "").strip() or None, "items": entries})
+                    barcodes.extend(entries)
+    elif isinstance(barcodes_raw, list):
+        for it in barcodes_raw:
+            if isinstance(it, str):
+                code = it.strip()
+                if code:
+                    barcodes.append({"code": code, "price": None, "description": None})
+            elif isinstance(it, dict):
+                code = str(it.get("code") or "").strip()
+                if code:
+                    barcodes.append(
+                        {
+                            "code": code,
+                            "price": _to_float(it.get("price")),
+                            "description": str(it.get("description") or "").strip() or None,
+                        }
+                    )
+        if barcodes:
+            barcode_sections = [{"name": None, "items": list(barcodes)}]
+    if not barcodes and isinstance(barcode_sections_raw, list):
+        for sec in barcode_sections_raw:
+            if not isinstance(sec, dict):
+                continue
+            items_raw = sec.get("items")
+            if not isinstance(items_raw, list):
+                continue
+            entries: list[dict[str, Any]] = []
+            for it in items_raw:
+                if isinstance(it, str):
+                    code = it.strip()
+                    if code:
+                        entries.append({"code": code, "price": None, "description": None})
+                elif isinstance(it, dict):
+                    code = str(it.get("code") or "").strip()
+                    if code:
+                        entries.append(
+                            {
+                                "code": code,
+                                "price": _to_float(it.get("price")),
+                                "description": str(it.get("description") or "").strip() or None,
+                            }
+                        )
+            if entries:
+                barcode_sections.append({"name": str(sec.get("name") or "").strip() or None, "items": entries})
+                barcodes.extend(entries)
+    if not barcodes:
+        barcode_single = str(getattr(row, "barcode", None) or "").strip()
+        if barcode_single:
+            barcodes = [{"code": barcode_single, "price": None, "description": None}]
+            barcode_sections = [{"name": None, "items": list(barcodes)}]
     price = _to_float(getattr(row, "price", None))
     return {
         "id": row.id,
         "manufacturer_id": getattr(row, "manufacturer_id", None),
         "manufacturer_name": manufacturer.name if manufacturer else "",
+        "manufacturer_image_url": getattr(manufacturer, "image_url", None) if manufacturer else None,
+        "manufacturer_country_name": manufacturer_country,
         "lens_name": row.lens_name,
         "description": getattr(row, "description", None),
         "full_description": getattr(row, "full_description", None),
         "barcode": getattr(row, "barcode", None),
-        "barcodes": barcodes if isinstance(barcodes, list) else [],
-        "barcode_sections": barcode_sections if isinstance(barcode_sections, list) else [],
+        "barcodes": barcodes,
+        "barcode_sections": barcode_sections,
         "photo_url": images[0] if images else None,
         "photo_urls": images,
         "sph": getattr(row, "sph", None),
@@ -167,6 +279,20 @@ def _snapshot_payload(db: Session) -> dict[str, Any]:
         if getattr(f, "icon_url", None):
             assets.add(f.icon_url)
 
+    sidebar_video = _read_sidebar_video_settings()
+    sv_url = sidebar_video.get("video_url")
+    if isinstance(sv_url, str):
+        sv_u = sv_url.strip()
+        if sv_u.startswith("/uploads/"):
+            assets.add(sv_u.split("?")[0])
+        elif sv_u.startswith("http://") or sv_u.startswith("https://"):
+            try:
+                path = urlparse(sv_u).path
+                if path.startswith("/uploads/"):
+                    assets.add(path.split("?")[0])
+            except Exception:
+                pass
+
     def _group_payload(rows: list[Any]) -> list[dict[str, Any]]:
         return [
             {
@@ -239,6 +365,7 @@ def _snapshot_payload(db: Session) -> dict[str, Any]:
         "pricelist_groups": _group_payload(warehouse_groups),
         "pricelist_rx_groups": _group_payload(rx_groups),
         "pricelist_mkl_groups": _group_payload(mkl_groups),
+        "sidebar_video": sidebar_video,
         "assets": sorted(assets),
     }
     normalized = json.dumps(snapshot_data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -252,15 +379,31 @@ def _snapshot_payload(db: Session) -> dict[str, Any]:
     }
 
 
-@router.get("/api/offline/version")
-def get_offline_version(db: Session = Depends(get_db)) -> dict[str, Any]:
+_OFFLINE_VERSION_CACHE: dict[str, Any] | None = None
+_OFFLINE_VERSION_CACHE_AT: float = 0.0
+_OFFLINE_VERSION_TTL_SEC = 120.0
+
+
+def _offline_version_meta(db: Session) -> dict[str, Any]:
+    global _OFFLINE_VERSION_CACHE, _OFFLINE_VERSION_CACHE_AT
+    now = time.monotonic()
+    if _OFFLINE_VERSION_CACHE is not None and (now - _OFFLINE_VERSION_CACHE_AT) < _OFFLINE_VERSION_TTL_SEC:
+        return _OFFLINE_VERSION_CACHE
     payload = _snapshot_payload(db)
-    return {
+    meta = {
         "version": payload["version"],
         "checksum": payload["checksum"],
         "generated_at": payload["generated_at"],
         "asset_count": len(payload["snapshot"]["assets"]),
     }
+    _OFFLINE_VERSION_CACHE = meta
+    _OFFLINE_VERSION_CACHE_AT = now
+    return meta
+
+
+@router.get("/api/offline/version")
+def get_offline_version(db: Session = Depends(get_db)) -> dict[str, Any]:
+    return _offline_version_meta(db)
 
 
 @router.get("/api/offline/snapshot")

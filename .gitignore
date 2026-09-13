@@ -1,0 +1,33 @@
+# Secrets & local env
+.env
+.env.*
+!.env.example
+firebase-service-account.json
+webpush-vapid-private.pem
+*.pem
+
+# Runtime / local data
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+crm.db
+*.db
+uploads/
+logs/
+export/
+
+# Backups / junk
+*.bak
+*.bak.*
+*.truncated.bak
+main.py.bak*
+models.py.truncated.bak
+schemas.py.bak*
+routers/*.bak*
+**/node_modules/
+.DS_Store

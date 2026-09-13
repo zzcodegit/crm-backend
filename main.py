@@ -1,6 +1,8 @@
+import base64
 import json
 import logging
 from datetime import datetime, timezone
+from fastapi.responses import JSONResponse
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -11,7 +13,7 @@ from sqlalchemy import func as sa_func
 from pydantic import BaseModel
 
 from database import get_db, engine, Base
-from models import Group, User
+from models import Group, User, Order1cExchangeLog
 from schemas import Token, UserLogin, MeResponse, SetupPasswordRequest
 from auth import verify_password, get_password_hash, create_access_token, decode_token
 from routers import users as users_router
@@ -23,19 +25,36 @@ from routers import reports as reports_router
 from routers import central_cash as central_cash_router
 from routers import work_schedule as work_schedule_router
 from routers import chat as chat_router
+from routers import chat_calls as chat_calls_router
+from routers import chat_folders as chat_folders_router
+from routers import chat_bot as chat_bot_router
+from routers import chat_gigachat as chat_gigachat_router
 from routers import portal_tasks as portal_tasks_router
 from routers import supply_tickets as supply_tickets_router
 from routers import training as training_router
 from routers import normative_acts as normative_acts_router
 from routers import drive as drive_router
 from routers import offline_export as offline_export_router
-from routers.orders import create_order_from_1c, _order_to_response
-from deps import get_current_user, get_admin_user, get_impersonator_username, is_admin, is_manager, is_consultant
+from routers import mobile_clients as mobile_clients_router
+from routers import chat_birthday_reminders as chat_birthday_reminders_router
+from birthday_chat_reminders import start_birthday_reminder_worker
+from routers.orders import (
+    create_order_from_1c,
+    _order_to_response,
+    is_1c_bonus_only_payload,
+    is_valid_1c_order_payload,
+)
+from mutual_settlement_1c import validate_bonus_arr_mutual_settlements
+from deps import get_current_user, get_admin_user, get_impersonator_username, is_admin, is_manager, is_consultant, is_reportnik
 from report_required_validation import ALLOWED_REPORT_REQUIRED_KEYS
 from reports_table_columns import (
     ALLOWED_REPORT_TABLE_COLUMN_KEYS,
     CANONICAL_REPORT_TABLE_COLUMNS_ADMIN,
+    column_labels_overrides_only,
+    merge_report_table_column_labels,
+    normalize_report_table_column_labels,
     normalize_report_table_columns,
+    parse_reports_columns_settings_blob,
 )
 from chat_service import add_user_joined_general_chat_message, ensure_general_chat_member
 
@@ -46,13 +65,22 @@ REPORTS_TABLE_COLUMNS_DEFAULT_FILE = Path("/home/crm-backend/logs/reports_table_
 USER_REPORTS_TABLE_COLUMNS_FILE = Path("/home/crm-backend/logs/user_reports_table_columns.json")
 SIDEBAR_VIDEO_SETTINGS_FILE = Path("/home/crm-backend/logs/sidebar_video_settings.json")
 SIDEBAR_MENU_ORDER_SETTINGS_FILE = Path("/home/crm-backend/logs/sidebar_menu_order_settings.json")
+GIGACHAT_SETTINGS_FILE = Path("/home/crm-backend/logs/gigachat_settings.json")
+INFO_PAGE_SETTINGS_FILE = Path("/home/crm-backend/logs/info_page_settings.json")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "http://83.222.27.232",
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+        "capacitor://localhost",
+        "ionic://localhost",
+        "http://155.212.143.145",
+        "https://155.212.143.145",
         "https://mosoptika-study.ru",
         "http://mosoptika-study.ru",
         "https://www.mosoptika-study.ru",
@@ -403,6 +431,33 @@ def startup():
     except Exception:
         pass
 
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    "ALTER TABLE pricelist_rx_groups "
+                    "ADD COLUMN IF NOT EXISTS admin_only BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+    except Exception:
+        pass
+
+    # Реестр мобильных клиентов: склад, к которому привязано устройство.
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    "ALTER TABLE mobile_app_clients ADD COLUMN IF NOT EXISTS warehouse_id INTEGER"
+                )
+            )
+            conn.execute(
+                sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_mobile_app_clients_warehouse_id ON mobile_app_clients(warehouse_id)"
+                )
+            )
+    except Exception:
+        pass
+
     # Пользователи: телефон и дата рождения.
     try:
         with engine.begin() as conn:
@@ -416,6 +471,12 @@ def startup():
     try:
         with engine.begin() as conn:
             conn.execute(sa_text("ALTER TABLE group_chat_dialogs ADD COLUMN IF NOT EXISTS image_url VARCHAR(1024)"))
+            conn.execute(sa_text(
+                "ALTER TABLE group_chat_dialogs ADD COLUMN IF NOT EXISTS forbid_exit BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
+            conn.execute(sa_text(
+                "ALTER TABLE group_chat_dialogs ADD COLUMN IF NOT EXISTS is_channel BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
     except Exception:
         pass
 
@@ -439,6 +500,16 @@ def startup():
             conn.execute(
                 sa_text(
                     "ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL"
+                )
+            )
+    except Exception:
+        pass
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    "ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS hide_in_reports BOOLEAN NOT NULL DEFAULT FALSE"
                 )
             )
     except Exception:
@@ -477,6 +548,18 @@ def startup():
                     """
                 )
             )
+    except Exception:
+        pass
+
+    # Центральная касса: способ выдачи денег (справочник «Откуда взято»).
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    "ALTER TABLE central_cash_payouts ADD COLUMN IF NOT EXISTS taken_source_id INTEGER REFERENCES taken_sources(id) ON DELETE SET NULL"
+                )
+            )
+            conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_central_cash_payouts_taken_source_id ON central_cash_payouts(taken_source_id)"))
     except Exception:
         pass
 
@@ -565,8 +648,20 @@ def startup():
                     """
                 )
             )
+            conn.execute(sa_text("ALTER TABLE manual_withholdings ADD COLUMN IF NOT EXISTS closed BOOLEAN DEFAULT FALSE NOT NULL"))
+            conn.execute(sa_text("ALTER TABLE manual_withholdings ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ"))
+            conn.execute(sa_text("ALTER TABLE manual_withholdings ADD COLUMN IF NOT EXISTS closed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL"))
+            conn.execute(sa_text("UPDATE manual_withholdings SET closed = FALSE WHERE closed IS NULL"))
             conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_manual_withholdings_user_id ON manual_withholdings(user_id)"))
             conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_manual_withholdings_warehouse_id ON manual_withholdings(warehouse_id)"))
+            conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_manual_withholdings_closed ON manual_withholdings(closed)"))
+    except Exception:
+        pass
+
+    # Отчёты: погашение ручных удержаний (увеличивает наличные в кассе точки).
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa_text("ALTER TABLE daily_reports ADD COLUMN IF NOT EXISTS withholding_details JSONB"))
     except Exception:
         pass
 
@@ -579,6 +674,38 @@ def startup():
                 )
             )
             conn.execute(sa_text("UPDATE users SET chat_notifications_enabled = TRUE WHERE chat_notifications_enabled IS NULL"))
+    except Exception:
+        pass
+
+    # Групповой чат: уведомления отдельно для каждой группы (участник).
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    "ALTER TABLE group_chat_members ADD COLUMN IF NOT EXISTS notifications_enabled BOOLEAN DEFAULT TRUE NOT NULL"
+                )
+            )
+            conn.execute(
+                sa_text(
+                    "UPDATE group_chat_members SET notifications_enabled = TRUE WHERE notifications_enabled IS NULL"
+                )
+            )
+    except Exception:
+        pass
+
+    # Групповой чат: участники видят только свои сообщения (админы группы / CRM — все).
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    "ALTER TABLE group_chat_dialogs ADD COLUMN IF NOT EXISTS members_see_own_only BOOLEAN DEFAULT FALSE NOT NULL"
+                )
+            )
+            conn.execute(
+                sa_text(
+                    "UPDATE group_chat_dialogs SET members_see_own_only = FALSE WHERE members_see_own_only IS NULL"
+                )
+            )
     except Exception:
         pass
 
@@ -670,6 +797,96 @@ def startup():
     except Exception:
         pass
 
+    # Каналы: кнопка «Ознакомиться» на публикациях.
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS ack_required BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+            conn.execute(
+                sa_text(
+                    """
+                    CREATE TABLE IF NOT EXISTS chat_message_acknowledgments (
+                      id SERIAL PRIMARY KEY,
+                      message_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+                      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                      acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                sa_text(
+                    """
+                    DO $$
+                    BEGIN
+                      IF NOT EXISTS (
+                        SELECT 1 FROM pg_indexes WHERE indexname = 'idx_message_user_ack'
+                      ) THEN
+                        CREATE UNIQUE INDEX idx_message_user_ack
+                          ON chat_message_acknowledgments(message_id, user_id);
+                      END IF;
+                    END
+                    $$;
+                    """
+                )
+            )
+    except Exception:
+        pass
+
+    # Реакции на сообщения чата.
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    """
+                    CREATE TABLE IF NOT EXISTS chat_message_reactions (
+                      id SERIAL PRIMARY KEY,
+                      message_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+                      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                      emoji VARCHAR(32) NOT NULL,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                sa_text(
+                    """
+                    DO $$
+                    BEGIN
+                      IF NOT EXISTS (
+                        SELECT 1 FROM pg_indexes WHERE indexname = 'idx_message_user_reaction'
+                      ) THEN
+                        CREATE UNIQUE INDEX idx_message_user_reaction
+                          ON chat_message_reactions(message_id, user_id);
+                      END IF;
+                    END
+                    $$;
+                    """
+                )
+            )
+            conn.execute(
+                sa_text(
+                    """
+                    DO $$
+                    BEGIN
+                      IF NOT EXISTS (
+                        SELECT 1 FROM pg_indexes WHERE indexname = 'idx_chat_message_reactions_message_id'
+                      ) THEN
+                        CREATE INDEX idx_chat_message_reactions_message_id
+                          ON chat_message_reactions(message_id);
+                      END IF;
+                    END
+                    $$;
+                    """
+                )
+            )
+    except Exception:
+        pass
+
     # Training articles: разделы и картинка анонса.
     try:
         with engine.begin() as conn:
@@ -750,6 +967,91 @@ def startup():
             )
     except Exception:
         pass
+
+    # Обучение: просмотры статей (аналитика).
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sa_text(
+                    """
+                    CREATE TABLE IF NOT EXISTS training_article_views (
+                      id SERIAL PRIMARY KEY,
+                      article_id INTEGER NOT NULL REFERENCES training_articles(id) ON DELETE CASCADE,
+                      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                      view_count INTEGER NOT NULL DEFAULT 1,
+                      first_viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      last_viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                sa_text(
+                    """
+                    DO $$
+                    BEGIN
+                      IF NOT EXISTS (
+                        SELECT 1 FROM pg_indexes WHERE indexname = 'uq_training_article_view_user'
+                      ) THEN
+                        CREATE UNIQUE INDEX uq_training_article_view_user
+                          ON training_article_views(article_id, user_id);
+                      END IF;
+                    END
+                    $$;
+                    """
+                )
+            )
+            conn.execute(
+                sa_text(
+                    """
+                    DO $$
+                    BEGIN
+                      IF NOT EXISTS (
+                        SELECT 1 FROM pg_indexes WHERE indexname = 'ix_training_article_views_article_id'
+                      ) THEN
+                        CREATE INDEX ix_training_article_views_article_id
+                          ON training_article_views(article_id);
+                      END IF;
+                    END
+                    $$;
+                    """
+                )
+            )
+            conn.execute(
+                sa_text(
+                    """
+                    DO $$
+                    BEGIN
+                      IF NOT EXISTS (
+                        SELECT 1 FROM pg_indexes WHERE indexname = 'ix_training_article_views_user_id'
+                      ) THEN
+                        CREATE INDEX ix_training_article_views_user_id
+                          ON training_article_views(user_id);
+                      END IF;
+                    END
+                    $$;
+                    """
+                )
+            )
+    except Exception:
+        pass
+
+    start_birthday_reminder_worker()
+
+
+@app.get("/api/health")
+def health_check():
+    pool = engine.pool
+    return {
+        "ok": True,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "db_pool": {
+            "size": pool.size(),
+            "checked_in": pool.checkedin(),
+            "checked_out": pool.checkedout(),
+            "overflow": pool.overflow(),
+        },
+    }
 
 
 @app.post("/api/auth/login", response_model=Token)
@@ -833,6 +1135,7 @@ def update_my_profile(
     result.is_admin = is_admin(current_user)
     result.is_manager = is_manager(current_user)
     result.is_consultant = is_consultant(current_user)
+    result.is_reportnik = is_reportnik(current_user)
     if result.is_admin:
         result.role = "admin"
     elif result.is_manager:
@@ -854,6 +1157,7 @@ def me(
     data.is_admin = is_admin(current_user)
     data.is_manager = is_manager(current_user)
     data.is_consultant = is_consultant(current_user)
+    data.is_reportnik = is_reportnik(current_user)
     if data.is_admin:
         data.role = "admin"
     elif data.is_manager:
@@ -993,48 +1297,54 @@ def update_report_required_fields(
     return ReportRequiredFieldsPayload(required=clean)
 
 
-def _load_reports_default_columns_raw() -> list[str] | None:
+def _load_reports_default_settings() -> tuple[list[str] | None, dict[str, str]]:
     if not REPORTS_TABLE_COLUMNS_DEFAULT_FILE.exists():
-        return None
+        return None, {}
     try:
         data = json.loads(REPORTS_TABLE_COLUMNS_DEFAULT_FILE.read_text(encoding="utf-8"))
-        cols = data.get("columns", [])
-        if not isinstance(cols, list):
-            return None
-        return [x for x in cols if isinstance(x, str) and x in ALLOWED_REPORT_TABLE_COLUMN_KEYS]
+        cols, labels = parse_reports_columns_settings_blob(data)
+        if not cols:
+            return None, labels
+        return cols, labels
     except Exception:
-        return None
+        return None, {}
 
 
-def _load_user_reports_columns_map() -> dict[str, list[str]]:
+def _load_user_reports_columns_map() -> dict[str, dict]:
     if not USER_REPORTS_TABLE_COLUMNS_FILE.exists():
         return {}
     try:
         data = json.loads(USER_REPORTS_TABLE_COLUMNS_FILE.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return {}
-        out: dict[str, list[str]] = {}
-        for uid, cols in data.items():
-            if not isinstance(uid, str) or not isinstance(cols, list):
+        out: dict[str, dict] = {}
+        for uid, entry in data.items():
+            if not isinstance(uid, str):
                 continue
-            out[uid] = [x for x in cols if isinstance(x, str) and x in ALLOWED_REPORT_TABLE_COLUMN_KEYS]
+            cols, labels = parse_reports_columns_settings_blob(entry)
+            if not cols:
+                continue
+            out[uid] = {"columns": cols, "labels": labels}
         return out
     except Exception:
         return {}
 
 
-def _save_user_reports_columns_map(m: dict[str, list[str]]) -> None:
+def _save_user_reports_columns_map(m: dict[str, dict]) -> None:
     USER_REPORTS_TABLE_COLUMNS_FILE.parent.mkdir(parents=True, exist_ok=True)
     USER_REPORTS_TABLE_COLUMNS_FILE.write_text(json.dumps(m, ensure_ascii=False), encoding="utf-8")
 
 
 class ReportsTableColumnsPayload(BaseModel):
     columns: list[str] = []
+    labels: dict[str, str] = {}
 
 
 class ReportsTableColumnsResponse(BaseModel):
     default_columns: list[str]
+    default_labels: dict[str, str] = {}
     mine_columns: list[str] | None = None
+    mine_labels: dict[str, str] | None = None
 
 
 class SidebarVideoSettingsPayload(BaseModel):
@@ -1046,21 +1356,57 @@ class SidebarMenuOrderSettingsPayload(BaseModel):
     order: list[str] = []
 
 
+class InfoPageSettingsPayload(BaseModel):
+    text: str = ""
+    updated_at: str | None = None
+
+
+class NewUserChatGroupOption(BaseModel):
+    id: int
+    name: str
+    is_channel: bool = False
+
+
+class NewUserChatGroupsSettingsPayload(BaseModel):
+    dialog_ids: list[int] = []
+    dialogs: list[NewUserChatGroupOption] = []
+
+
+class GigaChatSettingsPayload(BaseModel):
+    enabled: bool = False
+    visible_group_ids: list[int] = []
+
+
 @app.get("/api/settings/reports-table-columns", response_model=ReportsTableColumnsResponse)
 def get_reports_table_columns(current_user: User = Depends(get_current_user)):
     """Общий порядок столбцов и персональный (если задан)."""
     admin = is_admin(current_user)
-    raw_default = _load_reports_default_columns_raw()
-    base_default = raw_default if raw_default else CANONICAL_REPORT_TABLE_COLUMNS_ADMIN
-    default_columns = normalize_report_table_columns(base_default, for_admin=admin)
+    raw_default, default_labels_raw = _load_reports_default_settings()
+    default_columns = normalize_report_table_columns(
+        raw_default,
+        for_admin=admin,
+        append_missing=raw_default is None,
+    )
+    default_labels = merge_report_table_column_labels(default_labels_raw)
 
     umap = _load_user_reports_columns_map()
-    mine_raw = umap.get(str(current_user.id))
+    mine_entry = umap.get(str(current_user.id))
     mine_columns: list[str] | None = None
-    if mine_raw is not None:
-        mine_columns = normalize_report_table_columns(mine_raw, for_admin=admin)
+    mine_labels: dict[str, str] | None = None
+    if mine_entry is not None:
+        mine_columns = normalize_report_table_columns(
+            mine_entry.get("columns"),
+            for_admin=admin,
+            append_missing=False,
+        )
+        mine_labels = merge_report_table_column_labels(mine_entry.get("labels"))
 
-    return ReportsTableColumnsResponse(default_columns=default_columns, mine_columns=mine_columns)
+    return ReportsTableColumnsResponse(
+        default_columns=default_columns,
+        default_labels=default_labels,
+        mine_columns=mine_columns,
+        mine_labels=mine_labels,
+    )
 
 
 @app.put("/api/settings/reports-table-columns/default", response_model=ReportsTableColumnsPayload)
@@ -1070,13 +1416,17 @@ def put_reports_table_columns_default(
 ):
     if not is_admin(current_user):
         raise HTTPException(status_code=403, detail="Недостаточно прав")
-    clean = normalize_report_table_columns(payload.columns, for_admin=True)
+    clean = normalize_report_table_columns(payload.columns, for_admin=True, append_missing=False)
+    labels = column_labels_overrides_only(normalize_report_table_column_labels(payload.labels))
     REPORTS_TABLE_COLUMNS_DEFAULT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    blob: dict = {"columns": clean}
+    if labels:
+        blob["labels"] = labels
     REPORTS_TABLE_COLUMNS_DEFAULT_FILE.write_text(
-        json.dumps({"columns": clean}, ensure_ascii=False),
+        json.dumps(blob, ensure_ascii=False),
         encoding="utf-8",
     )
-    return ReportsTableColumnsPayload(columns=clean)
+    return ReportsTableColumnsPayload(columns=clean, labels=merge_report_table_column_labels(labels))
 
 
 @app.put("/api/settings/reports-table-columns/mine", response_model=ReportsTableColumnsPayload)
@@ -1085,11 +1435,15 @@ def put_reports_table_columns_mine(
     current_user: User = Depends(get_current_user),
 ):
     admin = is_admin(current_user)
-    clean = normalize_report_table_columns(payload.columns, for_admin=admin)
+    clean = normalize_report_table_columns(payload.columns, for_admin=admin, append_missing=False)
+    labels = column_labels_overrides_only(normalize_report_table_column_labels(payload.labels))
     umap = _load_user_reports_columns_map()
-    umap[str(current_user.id)] = clean
+    entry: dict = {"columns": clean}
+    if labels:
+        entry["labels"] = labels
+    umap[str(current_user.id)] = entry
     _save_user_reports_columns_map(umap)
-    return ReportsTableColumnsPayload(columns=clean)
+    return ReportsTableColumnsPayload(columns=clean, labels=merge_report_table_column_labels(labels))
 
 
 @app.delete("/api/settings/reports-table-columns/mine")
@@ -1149,6 +1503,53 @@ def put_sidebar_video_settings(
     return SidebarVideoSettingsPayload(video_url=video_url, visible_group_ids=visible_group_ids)
 
 
+@app.get("/api/settings/gigachat", response_model=GigaChatSettingsPayload)
+def get_gigachat_settings(_: User = Depends(get_current_user)):
+    if not GIGACHAT_SETTINGS_FILE.exists():
+        return GigaChatSettingsPayload(enabled=False, visible_group_ids=[])
+    try:
+        data = json.loads(GIGACHAT_SETTINGS_FILE.read_text(encoding="utf-8"))
+        enabled_raw = data.get("enabled", False)
+        groups_raw = data.get("visible_group_ids", [])
+        enabled = bool(enabled_raw)
+        visible_group_ids: list[int] = []
+        if isinstance(groups_raw, list):
+            for v in groups_raw:
+                try:
+                    iv = int(v)
+                except Exception:
+                    continue
+                if iv > 0 and iv not in visible_group_ids:
+                    visible_group_ids.append(iv)
+        return GigaChatSettingsPayload(enabled=enabled, visible_group_ids=visible_group_ids)
+    except Exception:
+        return GigaChatSettingsPayload(enabled=False, visible_group_ids=[])
+
+
+@app.put("/api/settings/gigachat", response_model=GigaChatSettingsPayload)
+def put_gigachat_settings(
+    payload: GigaChatSettingsPayload,
+    current_user: User = Depends(get_current_user),
+):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Недостаточно прав")
+    enabled = bool(payload.enabled)
+    visible_group_ids: list[int] = []
+    for v in payload.visible_group_ids:
+        try:
+            iv = int(v)
+        except Exception:
+            continue
+        if iv > 0 and iv not in visible_group_ids:
+            visible_group_ids.append(iv)
+    GIGACHAT_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    GIGACHAT_SETTINGS_FILE.write_text(
+        json.dumps({"enabled": enabled, "visible_group_ids": visible_group_ids}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return GigaChatSettingsPayload(enabled=enabled, visible_group_ids=visible_group_ids)
+
+
 @app.get("/api/settings/sidebar-menu-order", response_model=SidebarMenuOrderSettingsPayload)
 def get_sidebar_menu_order_settings(_: User = Depends(get_current_user)):
     if not SIDEBAR_MENU_ORDER_SETTINGS_FILE.exists():
@@ -1194,8 +1595,119 @@ def put_sidebar_menu_order_settings(
     return SidebarMenuOrderSettingsPayload(order=order)
 
 
+@app.get("/api/settings/info-page", response_model=InfoPageSettingsPayload)
+def get_info_page_settings(_: User = Depends(get_current_user)):
+    if not INFO_PAGE_SETTINGS_FILE.exists():
+        return InfoPageSettingsPayload(text="", updated_at=None)
+    try:
+        data = json.loads(INFO_PAGE_SETTINGS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return InfoPageSettingsPayload(text="", updated_at=None)
+        return InfoPageSettingsPayload(
+            text=str(data.get("text") or ""),
+            updated_at=(data.get("updated_at") or None),
+        )
+    except Exception:
+        return InfoPageSettingsPayload(text="", updated_at=None)
+
+
+@app.put("/api/settings/info-page", response_model=InfoPageSettingsPayload)
+def put_info_page_settings(
+    payload: InfoPageSettingsPayload,
+    current_user: User = Depends(get_current_user),
+):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Недостаточно прав")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    out = {"text": payload.text or "", "updated_at": now_iso}
+    INFO_PAGE_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    INFO_PAGE_SETTINGS_FILE.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+    return InfoPageSettingsPayload(text=out["text"], updated_at=out["updated_at"])
+
+
+@app.get("/api/settings/new-user-chat-groups", response_model=NewUserChatGroupsSettingsPayload)
+def get_new_user_chat_groups(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Недостаточно прав")
+    from chat_default_groups import load_default_chat_dialog_ids
+    from models import GroupChatDialog
+
+    rows = db.query(GroupChatDialog).order_by(GroupChatDialog.name).all()
+    return NewUserChatGroupsSettingsPayload(
+        dialog_ids=load_default_chat_dialog_ids(),
+        dialogs=[
+            NewUserChatGroupOption(id=d.id, name=d.name, is_channel=bool(getattr(d, "is_channel", False)))
+            for d in rows
+        ],
+    )
+
+
+@app.put("/api/settings/new-user-chat-groups", response_model=NewUserChatGroupsSettingsPayload)
+def put_new_user_chat_groups(
+    payload: NewUserChatGroupsSettingsPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Недостаточно прав")
+    from chat_default_groups import save_default_chat_dialog_ids
+    from models import GroupChatDialog
+
+    clean = save_default_chat_dialog_ids(payload.dialog_ids)
+    rows = db.query(GroupChatDialog).order_by(GroupChatDialog.name).all()
+    return NewUserChatGroupsSettingsPayload(
+        dialog_ids=clean,
+        dialogs=[
+            NewUserChatGroupOption(id=d.id, name=d.name, is_channel=bool(getattr(d, "is_channel", False)))
+            for d in rows
+        ],
+    )
+
+
 # Лог входящих тел от 1С (POST /api/order/ и алиасов) — для отладки
 ORDER_1C_LOG = Path("/home/crm-backend/logs/order_1c_body.log")
+
+
+def _persist_order_1c_exchange_log(
+    db: Session,
+    *,
+    request_path: str,
+    client_ip: str,
+    content_type: str | None,
+    body_len: int,
+    body_encoding: str,
+    body_text: str | None,
+    json_parse_ok: bool,
+    payload_is_object: bool,
+    order_created: bool,
+    order_id: int | None,
+    error_message: str | None,
+) -> None:
+    try:
+        row = Order1cExchangeLog(
+            request_path=request_path[:512],
+            client_ip=(client_ip or "unknown")[:128],
+            content_type=(content_type[:512] if content_type else None),
+            body_length=body_len,
+            body_encoding=(body_encoding or "utf-8")[:16],
+            body_text=body_text,
+            json_parse_ok=json_parse_ok,
+            payload_is_object=payload_is_object,
+            order_created=order_created,
+            order_id=order_id,
+            error_message=error_message,
+        )
+        db.add(row)
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logging.exception("Не удалось записать order_1c_exchange_logs")
 
 
 @app.post("/api/order/")
@@ -1206,10 +1718,12 @@ async def order_from_1c(request: Request, db: Session = Depends(get_db)):
     client = request.client.host if request.client else "unknown"
     forwarded = request.headers.get("x-forwarded-for", "").strip().split(",")[0].strip() or client
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    path = request.url.path
+    ct = request.headers.get("content-type", "") or None
     ORDER_1C_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(ORDER_1C_LOG, "a", encoding="utf-8") as f:
         f.write(
-            f"\n--- {ts} | path={request.url.path} | client={forwarded} | content-type={request.headers.get('content-type', '')} | len={len(body)} ---\n"
+            f"\n--- {ts} | path={path} | client={forwarded} | content-type={ct or ''} | len={len(body)} ---\n"
         )
         try:
             f.write(body.decode("utf-8"))
@@ -1218,18 +1732,159 @@ async def order_from_1c(request: Request, db: Session = Depends(get_db)):
         f.write("\n")
 
     try:
-        raw = body.decode("utf-8")
-        payload = json.loads(raw)
+        raw_utf8 = body.decode("utf-8")
+        body_encoding = "utf-8"
+        body_text_store = raw_utf8
+    except UnicodeDecodeError:
+        body_encoding = "base64"
+        body_text_store = base64.b64encode(body).decode("ascii")
+        _persist_order_1c_exchange_log(
+            db,
+            request_path=path,
+            client_ip=forwarded,
+            content_type=ct,
+            body_len=len(body),
+            body_encoding=body_encoding,
+            body_text=body_text_store,
+            json_parse_ok=False,
+            payload_is_object=False,
+            order_created=False,
+            order_id=None,
+            error_message="Тело запроса не в UTF-8; ожидается JSON в UTF-8",
+        )
+        return {"received": False, "error": "Invalid body encoding: expected UTF-8 JSON"}
+
+    try:
+        payload = json.loads(raw_utf8)
     except Exception as e:
+        _persist_order_1c_exchange_log(
+            db,
+            request_path=path,
+            client_ip=forwarded,
+            content_type=ct,
+            body_len=len(body),
+            body_encoding=body_encoding,
+            body_text=body_text_store,
+            json_parse_ok=False,
+            payload_is_object=False,
+            order_created=False,
+            order_id=None,
+            error_message=f"Invalid JSON: {e!s}",
+        )
         return {"received": False, "error": f"Invalid JSON: {e!s}"}
 
     if not isinstance(payload, dict):
+        _persist_order_1c_exchange_log(
+            db,
+            request_path=path,
+            client_ip=forwarded,
+            content_type=ct,
+            body_len=len(body),
+            body_encoding=body_encoding,
+            body_text=body_text_store,
+            json_parse_ok=True,
+            payload_is_object=False,
+            order_created=False,
+            order_id=None,
+            error_message="Body must be a JSON object",
+        )
         return {"received": False, "error": "Body must be a JSON object"}
+
+    if is_1c_bonus_only_payload(payload):
+        ok, err, skip_persist = validate_bonus_arr_mutual_settlements(db, payload)
+        if not ok:
+            _persist_order_1c_exchange_log(
+                db,
+                request_path=path,
+                client_ip=forwarded,
+                content_type=ct,
+                body_len=len(body),
+                body_encoding=body_encoding,
+                body_text=body_text_store,
+                json_parse_ok=True,
+                payload_is_object=True,
+                order_created=False,
+                order_id=None,
+                error_message=err,
+            )
+            return {"received": False, "error": err or "bonus_arr rejected"}
+        if skip_persist:
+            return {
+                "received": True,
+                "type": "bonus_arr",
+                "order_created": False,
+                "duplicate": True,
+                "skipped": True,
+            }
+        _persist_order_1c_exchange_log(
+            db,
+            request_path=path,
+            client_ip=forwarded,
+            content_type=ct,
+            body_len=len(body),
+            body_encoding=body_encoding,
+            body_text=body_text_store,
+            json_parse_ok=True,
+            payload_is_object=True,
+            order_created=False,
+            order_id=None,
+            error_message=None,
+        )
+        return {"received": True, "type": "bonus_arr", "order_created": False, "duplicate": False}
+
+    if not is_valid_1c_order_payload(payload):
+        _persist_order_1c_exchange_log(
+            db,
+            request_path=path,
+            client_ip=forwarded,
+            content_type=ct,
+            body_len=len(body),
+            body_encoding=body_encoding,
+            body_text=body_text_store,
+            json_parse_ok=True,
+            payload_is_object=True,
+            order_created=False,
+            order_id=None,
+            error_message="Не распознан как заказ 1С (нет stocks и данных клиента)",
+        )
+        return {"received": False, "error": "Payload is not a 1C order document"}
 
     try:
         order = create_order_from_1c(db, payload)
+        _persist_order_1c_exchange_log(
+            db,
+            request_path=path,
+            client_ip=forwarded,
+            content_type=ct,
+            body_len=len(body),
+            body_encoding=body_encoding,
+            body_text=body_text_store,
+            json_parse_ok=True,
+            payload_is_object=True,
+            order_created=True,
+            order_id=order.id,
+            error_message=None,
+        )
         return {"received": True, "order_id": order.id, "order": _order_to_response(order)}
     except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _persist_order_1c_exchange_log(
+            db,
+            request_path=path,
+            client_ip=forwarded,
+            content_type=ct,
+            body_len=len(body),
+            body_encoding=body_encoding,
+            body_text=body_text_store,
+            json_parse_ok=True,
+            payload_is_object=True,
+            order_created=False,
+            order_id=None,
+            error_message=str(e),
+        )
         return {"received": False, "error": str(e)}
 
 
@@ -1302,6 +1957,15 @@ def _get_ack_logger():
     return _ack_logger
 
 
+@app.get("/api/order/ack")
+@app.get("/api/order/ack/")
+@app.get("/api/order/accepted/ask")
+@app.get("/api/order/accepted/ask/")
+async def order_ack_from_1c_get():
+    """Проверка доступности эндпоинта для 1С (некоторые конфигурации делают GET перед POST)."""
+    return {"status": "ok", "message": "POST с JSON на этот URL"}
+
+
 @app.post("/api/order/ack")
 @app.post("/api/order/ack/")
 @app.post("/api/order/accepted/ask")
@@ -1348,14 +2012,14 @@ async def order_ack_from_1c(request: Request, db: Session = Depends(get_db)):
         return tokens2
 
     body = None
+    raw = ""
     try:
-        body = await request.json()
+        raw = body_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        raw = ""
+    try:
+        body = json.loads(raw) if raw.strip() else None
     except Exception as e:
-        # Не валимся: попробуем распарсить номера из сырого тела
-        try:
-            raw = body_bytes.decode("utf-8", errors="replace")
-        except Exception:
-            raw = ""
         extracted = _extract_order_numbers_from_raw(raw)
         if extracted:
             log.warning(
@@ -1363,8 +2027,11 @@ async def order_ack_from_1c(request: Request, db: Session = Depends(get_db)):
             )
             body = {"order_numbers": extracted}
         else:
-            log.warning(f"ack | client={forwarded} | invalid_json | error={e!s}")
-            return {"order_numbers": [], "error": "Invalid JSON"}
+            log.warning(f"ack | client={forwarded} | invalid_json | error={e!s} | raw={raw[:500]!r}")
+            return JSONResponse(
+                content={"order_numbers": [], "error": "Invalid JSON"},
+                media_type="application/json; charset=utf-8",
+            )
     if body is None:
         log.warning(f"ack | client={forwarded} | body_null")
         return {"order_numbers": []}
@@ -1467,6 +2134,10 @@ app.include_router(groups_router.router)
 app.include_router(orders_router.router)
 app.include_router(references_router.router)
 app.include_router(chat_router.router)
+app.include_router(chat_folders_router.router)
+app.include_router(chat_bot_router.router)
+app.include_router(chat_gigachat_router.router)
+app.include_router(chat_calls_router.router)
 app.include_router(portal_tasks_router.router)
 app.include_router(supply_tickets_router.router)
 app.include_router(training_router.router)
@@ -1477,11 +2148,26 @@ app.include_router(reports_router.router)
 app.include_router(central_cash_router.router)
 app.include_router(work_schedule_router.router)
 app.include_router(offline_export_router.router)
+app.include_router(mobile_clients_router.router)
+app.include_router(chat_birthday_reminders_router.router)
 
 # Раздача загруженных файлов
 UPLOAD_DIR = Path("/home/crm-backend/uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
+
+class UploadStaticFiles(StaticFiles):
+    """Голосовые voice-*.webm отдаём как audio/webm — иначе часть браузеров не воспроизводит в <audio>."""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        name = Path(path).name.lower()
+        if name.startswith("voice-") and name.endswith(".webm"):
+            response.headers["content-type"] = "audio/webm"
+        return response
+
+
+app.mount("/uploads", UploadStaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 
 if __name__ == "__main__":
