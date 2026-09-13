@@ -33,10 +33,8 @@ from models import (
     Group,
 )
 from mutual_settlement_1c import (
-    extract_doc_number,
-    extract_operation_year,
-    extract_year_from_doc,
     is_mutual_settlement_entry,
+    mutual_settlement_dup_key_from_entry,
 )
 from schemas import (
     AvailableDebtResponse,
@@ -175,16 +173,27 @@ class _VzyalaDisplayContext:
         self.debt_by_uid = debt_by_uid
 
 
-def _load_vzyala_display_context(db: Session) -> _VzyalaDisplayContext:
+def _load_vzyala_display_context(
+    db: Session,
+    *,
+    only_debt_uids: set[str] | None = None,
+) -> _VzyalaDisplayContext:
+    """Индекс долгов для подписей «Взято».
+
+    only_debt_uids: если задан — индексируем только эти uid (ускорение сводки «Взято»).
+    """
     taken_reason_by_id = {x.id: x.name for x in db.query(TakenReason).all()}
     taken_reason_by_id[TAKE_DEBT_REASON_VIRTUAL_ID] = TAKE_DEBT_REASON_LABEL
     taken_source_by_id = {x.id: x.name for x in db.query(TakenSource).all()}
     debt_reason_by_id = {x.id: x.name for x in db.query(DebtReason).all()}
     warehouse_by_id = {x.id: x.name for x in db.query(Warehouse).all()}
     debt_by_uid: dict[str, dict] = {}
+    want = only_debt_uids
 
     def _put_debt(uid: str, **fields) -> None:
         if not uid:
+            return
+        if want is not None and uid not in want:
             return
         prev = debt_by_uid.get(uid, {})
         merged = {**prev, **{k: v for k, v in fields.items() if v is not None and v != ""}}
@@ -212,6 +221,7 @@ def _load_vzyala_display_context(db: Session) -> _VzyalaDisplayContext:
             wh_name = warehouse_by_id.get(wh_id) if wh_id is not None else None
             _put_debt(
                 uid,
+                debt_origin="report",
                 debt_reason_name=debt_reason_by_id.get(drid) if drid is not None else None,
                 order_number=str(row.get("order_number") or ""),
                 debt_report_id=report.id,
@@ -237,9 +247,11 @@ def _load_vzyala_display_context(db: Session) -> _VzyalaDisplayContext:
         m_wh_name = m.warehouse.name if getattr(m, "warehouse", None) else warehouse_by_id.get(m_wh_id) if m_wh_id else None
         _put_debt(
             uid,
+            debt_origin="manual",
             debt_reason_name=drn,
             order_number=str(m.order_number or ""),
             debt_report_id=0,
+            admin_note=(m.note or "").strip() or None,
             debt_date=_debt_date_display(
                 str(m.report_month).strip() if m.report_month is not None else None,
                 m.created_at,
@@ -249,22 +261,77 @@ def _load_vzyala_display_context(db: Session) -> _VzyalaDisplayContext:
             warehouse_name=m_wh_name,
         )
 
-    for entry in _collect_one_c_bonus_debts(db):
-        uid = str(entry["uid"])
-        label = str(entry.get("record_type_label") or "").strip()
-        _put_debt(
-            uid,
-            debt_reason_name=(f"1С: {label}" if label else "1С"),
-            order_number=str(entry.get("order_number") or ""),
-            debt_report_id=0,
-            debt_date=_debt_date_display(
-                str(entry.get("operation_date")).strip() if entry.get("operation_date") else None,
-                entry.get("log_created_at"),
-                entry.get("log_created_at"),
-            ),
-            warehouse_id=entry.get("warehouse_id"),
-            warehouse_name=entry.get("warehouse_name"),
-        )
+    if want is None:
+        for entry in _collect_one_c_bonus_debts(db):
+            uid = str(entry["uid"])
+            label = str(entry.get("record_type_label") or "").strip()
+            _put_debt(
+                uid,
+                debt_origin="1c",
+                debt_reason_name=(f"1С: {label}" if label else "1С"),
+                order_number=str(entry.get("order_number") or ""),
+                doc=str(entry.get("doc") or "").strip() or None,
+                comment=str(entry.get("comment") or "").strip() or None,
+                record_type=label or None,
+                debt_report_id=0,
+                debt_date=_debt_date_display(
+                    str(entry.get("operation_date")).strip() if entry.get("operation_date") else None,
+                    entry.get("log_created_at"),
+                    entry.get("log_created_at"),
+                ),
+                warehouse_id=entry.get("warehouse_id"),
+                warehouse_name=entry.get("warehouse_name"),
+            )
+    else:
+        # Только нужные строки 1С по uid вида 1c-log-{log_id}-{index} — без полного скана логов.
+        needed_by_log: dict[int, set[int]] = defaultdict(set)
+        for uid in want:
+            m = _ONE_C_DEBT_UID_RE.match(uid)
+            if not m:
+                continue
+            needed_by_log[int(m.group(1))].add(int(m.group(2)))
+        if needed_by_log:
+            log_ids = list(needed_by_log.keys())
+            # чанками — IN слишком большого списка тяжелее для планировщика
+            chunk = 500
+            for off in range(0, len(log_ids), chunk):
+                part = log_ids[off : off + chunk]
+                logs = db.query(Order1cExchangeLog).filter(Order1cExchangeLog.id.in_(part)).all()
+                for lg in logs:
+                    idxs = needed_by_log.get(lg.id) or set()
+                    raw = (lg.body_text or "").strip()
+                    if not raw or not idxs:
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    bonus_arr = payload.get("bonus_arr")
+                    if not isinstance(bonus_arr, list):
+                        continue
+                    for i in idxs:
+                        if i < 0 or i >= len(bonus_arr):
+                            continue
+                        row = bonus_arr[i]
+                        if not isinstance(row, dict) or row.get("_removed_from_debts"):
+                            continue
+                        uid = f"1c-log-{lg.id}-{i}"
+                        record_type = str(row.get("record_type") or "").strip()
+                        label = "Процент" if record_type.upper() == "ОРП" else record_type
+                        op_date = _format_one_c_operation_date(str(row.get("operation_date") or ""))
+                        _put_debt(
+                            uid,
+                            debt_origin="1c",
+                            debt_reason_name=(f"1С: {label}" if label else "1С"),
+                            order_number=str(row.get("order_number") or "").strip(),
+                            doc=str(row.get("doc") or "").strip() or None,
+                            comment=str(row.get("comment") or "").strip() or None,
+                            record_type=label or None,
+                            debt_report_id=0,
+                            debt_date=_debt_date_display(op_date, lg.created_at, lg.created_at),
+                        )
 
     return _VzyalaDisplayContext(taken_reason_by_id, taken_source_by_id, debt_by_uid)
 
@@ -283,7 +350,7 @@ def _resolve_vzyala_taken_source_name(
     ctx: _VzyalaDisplayContext,
     cc_pool_remaining: list[float],
 ) -> str | None:
-    """Источник «Взято»: справочник или Баланс / из кассы (FIFO по остатку ЦК до отчёта)."""
+    """«Откуда взято»: справочник или Баланс / из кассы (FIFO по остатку ЦК до отчёта)."""
     tsid = row.get("taken_source_id") if isinstance(row.get("taken_source_id"), int) else None
     explicit = ctx.taken_source_by_id.get(tsid) if tsid is not None else None
 
@@ -300,6 +367,68 @@ def _resolve_vzyala_taken_source_name(
     if explicit:
         return explicit
     return from_pool
+
+
+def _linked_debt_source_label(
+    linked_uid: str,
+    debt: dict,
+    *,
+    linked_report_id: int | None,
+) -> tuple[str | None, str | None]:
+    """Подпись документа долга для колонки «Источник»: (label, kind)."""
+    if not linked_uid:
+        return None, None
+    origin = str(debt.get("debt_origin") or "").strip()
+    if not origin:
+        if linked_uid.startswith("1c-log-"):
+            origin = "1c"
+        elif int(debt.get("debt_report_id") or 0) > 0:
+            origin = "report"
+        else:
+            origin = "manual"
+
+    parts: list[str] = []
+    if origin == "1c":
+        doc = str(debt.get("doc") or "").strip()
+        if doc:
+            parts.append(doc)
+        else:
+            parts.append(str(debt.get("debt_reason_name") or "1С").strip() or "1С")
+        rt = str(debt.get("record_type") or "").strip()
+        if rt and rt not in (parts[0] if parts else ""):
+            parts.append(f"тип: {rt}")
+        onum = str(debt.get("order_number") or "").strip()
+        if onum:
+            parts.append(f"заказ {onum}")
+        comment = str(debt.get("comment") or "").strip()
+        if comment:
+            parts.append(comment)
+        return " · ".join(parts), "1c"
+
+    if origin == "report":
+        rid = linked_report_id or debt.get("debt_report_id")
+        head = f"Отчёт #{rid}" if rid else "Отчёт"
+        parts.append(head)
+        drn = str(debt.get("debt_reason_name") or "").strip()
+        if drn:
+            parts.append(drn)
+        onum = str(debt.get("order_number") or "").strip()
+        if onum:
+            parts.append(f"заказ {onum}")
+        return " · ".join(parts), "report"
+
+    # manual
+    parts.append("Ручной долг")
+    drn = str(debt.get("debt_reason_name") or "").strip()
+    if drn:
+        parts.append(drn)
+    note = str(debt.get("admin_note") or "").strip()
+    if note:
+        parts.append(note)
+    onum = str(debt.get("order_number") or "").strip()
+    if onum:
+        parts.append(f"заказ {onum}")
+    return " · ".join(parts), "manual"
 
 
 def _enrich_vzyala_details_rows(
@@ -595,6 +724,8 @@ def _collect_one_c_bonus_debts(db: Session, *, for_user_id: int | None = None) -
                     "amount": amount,
                     "user_id": user_id,
                     "user_name": user_by_id.get(user_id, consultant_name or "1С") if user_id else (consultant_name or "1С"),
+                    "consultant": consultant_name,
+                    "record_type": record_type,
                     "record_type_label": record_type_label,
                     "trade_point": trade_point,
                     "order_number": str(row.get("order_number") or "").strip(),
@@ -608,16 +739,16 @@ def _collect_one_c_bonus_debts(db: Session, *, for_user_id: int | None = None) -
     if not out:
         return out
     # Одна и та же смена/документ/мотивация может прийти из 1С повторно.
-    # Взаимозачёт: ключ (год, номер 00ЦБ-N) — оставляем ПЕРВУЮ запись.
+    # Взаимозачёт: тип + год + номер 00ЦБ-N + консультант — оставляем ПЕРВУЮ запись.
+    # Два консультанта на одном документе — обе строки остаются.
     # Прочее: ключ user+doc+comment+type+sum — оставляем последнюю.
     best_by_key: dict[tuple, dict] = {}
     for entry in out:
         doc_key = str(entry.get("doc") or "").strip()
         if is_mutual_settlement_entry(entry):
-            year = extract_operation_year(str(entry.get("operation_date") or "")) or extract_year_from_doc(doc_key)
-            doc_num = extract_doc_number(doc_key)
-            if year is not None and doc_num is not None:
-                dedupe_key: tuple = ("mutual", int(year), int(doc_num))
+            mkey = mutual_settlement_dup_key_from_entry(entry)
+            if mkey is not None:
+                dedupe_key: tuple = ("mutual",) + mkey
                 prev = best_by_key.get(dedupe_key)
                 # первая по времени лога
                 if prev is None or (entry.get("log_created_at") or datetime.max.replace(tzinfo=timezone.utc)) < (
@@ -1555,6 +1686,60 @@ def _open_manual_withholdings_sum(db: Session, user_id: int) -> float:
     return total
 
 
+def _cc_pool_balance_before_by_report_id(
+    db: Session,
+    reports: list[DailyReport],
+) -> dict[int, float]:
+    """Остаток ЦК до «Взято» каждого отчёта — один проход FIFO на сотрудника (без N+1)."""
+    payouts = (
+        db.query(CentralCashPayout)
+        .order_by(CentralCashPayout.created_at.asc(), CentralCashPayout.id.asc())
+        .all()
+    )
+    payouts_by_user: dict[int, list[CentralCashPayout]] = defaultdict(list)
+    for p in payouts:
+        payouts_by_user[int(p.paid_to_user_id)].append(p)
+
+    by_user: dict[int, list[DailyReport]] = defaultdict(list)
+    for report in reports:
+        by_user[int(report.user_id)].append(report)
+
+    out: dict[int, float] = {}
+    for user_id, user_reports in by_user.items():
+        user_reports.sort(
+            key=lambda r: (
+                getattr(r, "submitted_at", None) or r.created_at or datetime.min.replace(tzinfo=timezone.utc),
+                r.id,
+            )
+        )
+        ups = payouts_by_user.get(user_id, [])
+        pools = [float(p.amount or 0) for p in ups]
+        payout_ats = [p.created_at for p in ups]
+        issued = sum(pools)
+        if issued <= DEBT_AMOUNT_EPS:
+            for report in user_reports:
+                out[report.id] = 0.0
+            continue
+        for report in user_reports:
+            out[report.id] = sum(max(0.0, p) for p in pools)
+            ts = getattr(report, "submitted_at", None) or report.created_at
+            if not ts:
+                continue
+            vsum = _vzyala_amount_for_report(report)
+            if vsum <= DEBT_AMOUNT_EPS:
+                continue
+            remaining = vsum
+            for i, payout_at in enumerate(payout_ats):
+                if payout_at and ts < payout_at:
+                    continue
+                take = min(remaining, pools[i])
+                pools[i] -= take
+                remaining -= take
+                if remaining <= DEBT_AMOUNT_EPS:
+                    break
+    return out
+
+
 def _employee_salary_balance(
     db: Session, user_id: int, *, exclude_report_id: int | None = None
 ) -> EmployeeSalaryBalanceResponse:
@@ -2394,24 +2579,33 @@ def delete_one_c_debt_log(
 
 def _compute_taken_summary_rows(db: Session) -> list[TakenSummaryRow]:
     """Все строки блока «Взято» по отправленным отчётам (для админ-сводки и личного вида консультанта)."""
-    ctx = _load_vzyala_display_context(db)
-    taken_reason_by_id = ctx.taken_reason_by_id
-    taken_source_by_id = ctx.taken_source_by_id
     user_by_id = {x.id: x.username for x in db.query(User).all()}
     warehouse_by_id = {x.id: x.name for x in db.query(Warehouse).all()}
     reports = (
         db.query(DailyReport)
-        .options(joinedload(DailyReport.warehouse), joinedload(DailyReport.user))
+        .options(joinedload(DailyReport.warehouse))
         .filter(DailyReport.is_draft.is_(False))
         .order_by(func.coalesce(DailyReport.submitted_at, DailyReport.created_at).desc(), DailyReport.id.desc())
         .all()
     )
+
+    linked_uids: set[str] = set()
+    for report in reports:
+        for row in _safe_vzyala_details_rows(getattr(report, "vzyala_details", None)):
+            uid = str(row.get("linked_debt_row_uid") or "").strip()
+            if uid:
+                linked_uids.add(uid)
+
+    ctx = _load_vzyala_display_context(db, only_debt_uids=linked_uids)
+    taken_reason_by_id = ctx.taken_reason_by_id
+    balance_before = _cc_pool_balance_before_by_report_id(db, reports)
+
     out: list[TakenSummaryRow] = []
     for report in reports:
         vz_rows = _safe_vzyala_details_rows(getattr(report, "vzyala_details", None))
-        cc_pool_remaining = [
-            max(0.0, _employee_salary_balance(db, report.user_id, exclude_report_id=report.id).balance)
-        ]
+        if not vz_rows:
+            continue
+        cc_pool_remaining = [max(0.0, float(balance_before.get(report.id, 0.0)))]
         for i, row in enumerate(vz_rows):
             raw_amt = row.get("amount")
             try:
@@ -2438,14 +2632,22 @@ def _compute_taken_summary_rows(db: Session) -> list[TakenSummaryRow]:
                     linked_report_id = None
             if linked:
                 debt = ctx.debt_by_uid.get(linked, {})
-                drn = (debt.get("debt_reason_name") or "").strip()
+                drn = (debt.get("debt_reason_name") or "").strip() or None
                 reason_name = drn or TAKE_DEBT_REASON_LABEL
+                debt_source_label, debt_source_kind = _linked_debt_source_label(
+                    linked, debt, linked_report_id=linked_report_id
+                )
+                debt_reason_name = drn
             elif taken_reason_id == TAKE_DEBT_REASON_VIRTUAL_ID:
                 reason_name = TAKE_DEBT_REASON_LABEL
+                debt_source_label, debt_source_kind = None, None
+                debt_reason_name = None
             else:
                 reason_name = (
                     taken_reason_by_id.get(taken_reason_id) if taken_reason_id is not None else None
                 )
+                debt_source_label, debt_source_kind = None, None
+                debt_reason_name = None
             source_name = _resolve_vzyala_taken_source_name(row, ctx, cc_pool_remaining)
             rm = row.get("report_month")
             report_month = str(rm).strip() if rm is not None else None
@@ -2470,6 +2672,9 @@ def _compute_taken_summary_rows(db: Session) -> list[TakenSummaryRow]:
                     linked_debt_row_uid=linked or None,
                     linked_debt_report_id=linked_report_id,
                     is_linked_debt_take=bool(linked),
+                    debt_source_label=debt_source_label,
+                    debt_source_kind=debt_source_kind,
+                    debt_reason_name=debt_reason_name,
                 )
             )
     return out
@@ -2806,11 +3011,18 @@ def get_employee_debt_ledger(
 
     for m in (
         db.query(ManualEmployeeDebt)
+        .options(joinedload(ManualEmployeeDebt.debt_reason_rel))
         .filter(ManualEmployeeDebt.user_id == user_id)
         .order_by(ManualEmployeeDebt.created_at.asc(), ManualEmployeeDebt.id.asc())
         .all()
     ):
         note_txt = f": {m.note}" if (m.note or "").strip() else ""
+        drn = None
+        if getattr(m, "debt_reason_rel", None) is not None:
+            drn = (m.debt_reason_rel.name or "").strip() or None
+        desc_parts = [f"Долг внесён вручную{note_txt} (запись №{m.id})"]
+        if drn:
+            desc_parts.append(drn)
         lines.append(
             EmployeeLedgerLine(
                 at=m.created_at,
@@ -2818,7 +3030,10 @@ def get_employee_debt_ledger(
                 report_id=None,
                 manual_debt_id=m.id,
                 amount=float(m.amount),
-                description=f"Долг внесён вручную{note_txt} (запись №{m.id})",
+                description=" · ".join(desc_parts),
+                debt_reason_name=drn,
+                debt_source_label=("Ручной долг" + (f" · {drn}" if drn else "") + note_txt),
+                debt_source_kind="manual",
             )
         )
 
@@ -2830,6 +3045,16 @@ def get_employee_debt_ledger(
     )
     debt_reason_by_id = {x.id: x.name for x in db.query(DebtReason).all()}
     taken_reason_by_id = {x.id: x.name for x in db.query(TakenReason).all()}
+    taken_reason_by_id[TAKE_DEBT_REASON_VIRTUAL_ID] = TAKE_DEBT_REASON_LABEL
+
+    linked_uids: set[str] = set()
+    for report in reports:
+        for row in _safe_vzyala_details_rows(getattr(report, "vzyala_details", None)):
+            uid = str(row.get("linked_debt_row_uid") or "").strip()
+            if uid:
+                linked_uids.add(uid)
+    ctx = _load_vzyala_display_context(db, only_debt_uids=linked_uids)
+    balance_before = _cc_pool_balance_before_by_report_id(db, reports)
 
     for report in reports:
         ts = getattr(report, "submitted_at", None) or report.created_at
@@ -2847,6 +3072,11 @@ def get_employee_debt_ledger(
             drid = row.get("debt_reason_id") if isinstance(row.get("debt_reason_id"), int) else None
             rn = debt_reason_by_id.get(drid) if drid is not None else None
             ordn = str(row.get("order_number") or "")
+            desc = f"Долг в отчёте №{report.id}"
+            if rn:
+                desc += f" · {rn}"
+            if ordn:
+                desc += f" · заказ {ordn}"
             lines.append(
                 EmployeeLedgerLine(
                     at=ts,
@@ -2854,10 +3084,17 @@ def get_employee_debt_ledger(
                     report_id=report.id,
                     manual_debt_id=None,
                     amount=amt,
-                    description=f"Долг в отчёте №{report.id}{(' · ' + rn) if rn else ''}{(' · заказ ' + ordn) if ordn else ''}",
+                    description=desc,
+                    debt_reason_name=rn,
+                    debt_source_label=desc,
+                    debt_source_kind="report",
                 )
             )
+
         vz_rows = _safe_vzyala_details_rows(getattr(report, "vzyala_details", None))
+        if not vz_rows:
+            continue
+        cc_pool_remaining = [max(0.0, float(balance_before.get(report.id, 0.0)))]
         for row in vz_rows:
             raw = row.get("amount")
             try:
@@ -2867,12 +3104,36 @@ def get_employee_debt_ledger(
             if amt is None or amt <= DEBT_AMOUNT_EPS:
                 continue
             trid = row.get("taken_reason_id") if isinstance(row.get("taken_reason_id"), int) else None
-            trn = taken_reason_by_id.get(trid) if trid is not None else None
             linked = str(row.get("linked_debt_row_uid") or "").strip()
+            lrid = row.get("linked_debt_report_id")
+            linked_report_id: int | None = None
+            if lrid is not None and str(lrid).strip() != "":
+                try:
+                    linked_report_id = int(lrid)
+                except (TypeError, ValueError):
+                    linked_report_id = None
+
+            debt_reason_name: str | None = None
+            debt_source_label: str | None = None
+            debt_source_kind: str | None = None
             if linked:
-                desc = f"Взято — зачёт долга ({trn or 'причина не указана'}) · отчёт №{report.id}"
+                debt = ctx.debt_by_uid.get(linked, {})
+                debt_reason_name = (debt.get("debt_reason_name") or "").strip() or None
+                taken_reason_name = debt_reason_name or TAKE_DEBT_REASON_LABEL
+                debt_source_label, debt_source_kind = _linked_debt_source_label(
+                    linked, debt, linked_report_id=linked_report_id
+                )
+                desc = f"Взято — зачёт долга · отчёт №{report.id}"
+                if debt_reason_name:
+                    desc += f" · {debt_reason_name}"
             else:
-                desc = f"Взято ({trn or 'строка зарплаты'}) · отчёт №{report.id}"
+                if trid == TAKE_DEBT_REASON_VIRTUAL_ID:
+                    taken_reason_name = TAKE_DEBT_REASON_LABEL
+                else:
+                    taken_reason_name = taken_reason_by_id.get(trid) if trid is not None else None
+                desc = f"Взято ({taken_reason_name or 'строка зарплаты'}) · отчёт №{report.id}"
+
+            taken_source_name = _resolve_vzyala_taken_source_name(row, ctx, cc_pool_remaining)
             lines.append(
                 EmployeeLedgerLine(
                     at=ts,
@@ -2881,6 +3142,13 @@ def get_employee_debt_ledger(
                     manual_debt_id=None,
                     amount=amt,
                     description=desc,
+                    taken_reason_name=taken_reason_name,
+                    taken_source_name=taken_source_name,
+                    debt_source_label=debt_source_label,
+                    debt_source_kind=debt_source_kind,
+                    debt_reason_name=debt_reason_name,
+                    is_linked_debt_take=bool(linked),
+                    linked_debt_report_id=linked_report_id,
                 )
             )
 

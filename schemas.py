@@ -1108,6 +1108,11 @@ class TakenSummaryRow(BaseModel):
     linked_debt_row_uid: str | None = None
     linked_debt_report_id: int | None = None
     is_linked_debt_take: bool = False
+    # Документ долга для колонки «Источник» (1С doc / отчёт / ручной).
+    debt_source_label: str | None = None
+    debt_source_kind: str | None = None  # 1c | report | manual
+    # Причина долга из привязанной строки (как в расшифровке «Взято»).
+    debt_reason_name: str | None = None
 
 
 class TakenSummaryResponse(BaseModel):
@@ -1121,6 +1126,13 @@ class EmployeeLedgerLine(BaseModel):
     manual_debt_id: int | None = None
     amount: float
     description: str
+    taken_reason_name: str | None = None
+    taken_source_name: str | None = None
+    debt_source_label: str | None = None
+    debt_source_kind: str | None = None
+    debt_reason_name: str | None = None
+    is_linked_debt_take: bool = False
+    linked_debt_report_id: int | None = None
 
 
 class EmployeeLedgerResponse(BaseModel):

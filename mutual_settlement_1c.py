@@ -1,7 +1,9 @@
 """Контроль дубликатов bonus_arr из 1С.
 
-Взаимозачёт: один документ (номер 00ЦБ-N) в рамках календарного года —
-первая запись остаётся, повтор не пишем и не обновляем.
+Взаимозачёт: ключ = тип записи + номер документа (00ЦБ-N) + календарный год + консультант.
+Первая запись остаётся; повтор того же ключа (даже с другой суммой) не пишем и не обновляем.
+Два консультанта на одном документе — две разные записи (это намеренно).
+Тот же номер в другом году — отдельная запись.
 """
 from __future__ import annotations
 
@@ -17,8 +19,19 @@ MUTUAL_SETTLEMENT_DOC_RE = re.compile(r"взаимозач", re.IGNORECASE)
 DOC_NUMBER_RE = re.compile(r"(?:00\s*ЦБ|00CB|00цб)\s*-\s*(\d+)", re.IGNORECASE)
 DOC_DATE_RE = re.compile(r"от\s+(\d{1,2})\.(\d{1,2})\.(\d{4})", re.IGNORECASE)
 
+# (record_type, year, doc_num, consultant)
+MutualDupKey = tuple[str, int, int, str]
+
 
 def normalize_order_number(value: Any) -> str:
+    return str(value or "").replace("\xa0", " ").strip()
+
+
+def normalize_consultant(value: Any) -> str:
+    return " ".join(str(value or "").replace("\xa0", " ").split())
+
+
+def normalize_record_type(value: Any) -> str:
     return str(value or "").replace("\xa0", " ").strip()
 
 
@@ -97,8 +110,8 @@ def mutual_settlement_key(row: dict) -> tuple[int, str] | None:
     return year, order_number
 
 
-def mutual_settlement_doc_year_key(row: dict) -> tuple[int, int] | None:
-    """Ключ дубля взаимозачёта: (календарный год, номер документа 00ЦБ-N)."""
+def mutual_settlement_dup_key(row: dict) -> MutualDupKey | None:
+    """Ключ дубля: (тип записи, год, номер 00ЦБ-N, консультант)."""
     if not is_mutual_settlement_row(row):
         return None
     doc = str(row.get("doc") or "")
@@ -106,7 +119,20 @@ def mutual_settlement_doc_year_key(row: dict) -> tuple[int, int] | None:
     year = extract_row_year(row)
     if doc_num is None or year is None:
         return None
-    return year, doc_num
+    return (
+        normalize_record_type(row.get("record_type")),
+        int(year),
+        int(doc_num),
+        normalize_consultant(row.get("consultant")),
+    )
+
+
+def mutual_settlement_doc_year_key(row: dict) -> tuple[int, int] | None:
+    """Устаревший ключ (год, номер) — оставлен для совместимости."""
+    key = mutual_settlement_dup_key(row)
+    if key is None:
+        return None
+    return key[1], key[2]
 
 
 def bonus_doc_sum_key(row: dict) -> tuple[str, float] | None:
@@ -154,9 +180,12 @@ def _iter_bonus_rows_from_logs(db: Session):
                 "sum": amount,
                 "doc_num": extract_doc_number(doc),
                 "year": extract_row_year(row),
+                "dup_key": mutual_settlement_dup_key(row) if is_mutual else None,
                 "doc_year_key": mutual_settlement_doc_year_key(row) if is_mutual else None,
                 "key": mutual_settlement_key(row) if is_mutual else None,
                 "is_mutual": is_mutual,
+                "record_type": normalize_record_type(row.get("record_type")),
+                "consultant": normalize_consultant(row.get("consultant")),
             }
 
 
@@ -173,8 +202,18 @@ def find_existing_bonus_doc_sums(db: Session) -> set[tuple[str, float]]:
     return existing
 
 
+def find_existing_mutual_dup_keys(db: Session) -> set[MutualDupKey]:
+    """Уже принятые взаимозачёты: (тип, год, номер, консультант)."""
+    existing: set[MutualDupKey] = set()
+    for entry in _iter_bonus_rows_from_logs(db):
+        key = entry.get("dup_key")
+        if key is not None:
+            existing.add(key)
+    return existing
+
+
 def find_existing_mutual_doc_years(db: Session) -> set[tuple[int, int]]:
-    """Уже принятые взаимозачёты: (год, номер документа)."""
+    """Устаревший индекс (год, номер) — для совместимости со старыми скриптами."""
     existing: set[tuple[int, int]] = set()
     for entry in _iter_bonus_rows_from_logs(db):
         key = entry.get("doc_year_key")
@@ -211,8 +250,9 @@ def validate_bonus_arr_mutual_settlements(db: Session, payload: dict) -> tuple[b
     """
     Проверка входящего bonus_arr перед записью лога 1С.
 
-    Взаимозачёт: дубль = тот же номер документа (00ЦБ-N) в том же календарном году.
+    Взаимозачёт: дубль = тип записи + номер 00ЦБ-N + год + консультант.
     Первая запись побеждает; повтор (даже с другой суммой) не пишем и не обновляем.
+    Два разных консультанта на одном документе — обе строки допустимы.
 
     Прочие строки bonus_arr: по-прежнему doc + sum.
 
@@ -225,13 +265,13 @@ def validate_bonus_arr_mutual_settlements(db: Session, payload: dict) -> tuple[b
     if not isinstance(bonus_arr, list):
         return True, None, False
 
-    mutual_keys: list[tuple[int, int]] = []
+    mutual_keys: list[MutualDupKey] = []
     other_keys: list[tuple[str, float]] = []
     for row in bonus_arr:
         if not isinstance(row, dict):
             continue
         if is_mutual_settlement_row(row):
-            key = mutual_settlement_doc_year_key(row)
+            key = mutual_settlement_dup_key(row)
             if key is not None:
                 mutual_keys.append(key)
             continue
@@ -243,7 +283,7 @@ def validate_bonus_arr_mutual_settlements(db: Session, payload: dict) -> tuple[b
         return True, None, False
 
     if mutual_keys:
-        existing_mutual = find_existing_mutual_doc_years(db)
+        existing_mutual = find_existing_mutual_dup_keys(db)
         mutual_all_dup = all(k in existing_mutual for k in mutual_keys)
     else:
         mutual_all_dup = True
@@ -264,6 +304,26 @@ def validate_bonus_arr_mutual_settlements(db: Session, payload: dict) -> tuple[b
 def is_mutual_settlement_entry(entry: dict) -> bool:
     doc = str(entry.get("doc") or "")
     return bool(MUTUAL_SETTLEMENT_DOC_RE.search(doc))
+
+
+def mutual_settlement_dup_key_from_entry(entry: dict) -> MutualDupKey | None:
+    """Ключ дубля из строки сводки долгов (после _collect_one_c_bonus_debts)."""
+    if not is_mutual_settlement_entry(entry):
+        return None
+    doc = str(entry.get("doc") or "")
+    doc_num = extract_doc_number(doc)
+    year = extract_operation_year(str(entry.get("operation_date") or "")) or extract_year_from_doc(doc)
+    if doc_num is None or year is None:
+        return None
+    record_type = normalize_record_type(
+        entry.get("record_type") if entry.get("record_type") is not None else entry.get("record_type_label")
+    )
+    # В сводке ОРП уже может быть заменён на «Процент» — для ключа берём как есть из record_type,
+    # а если его нет, не маппим обратно (лучше стабильный raw из лога).
+    consultant = normalize_consultant(
+        entry.get("consultant") if entry.get("consultant") is not None else entry.get("user_name")
+    )
+    return record_type, int(year), int(doc_num), consultant
 
 
 def pick_preferred_mutual_settlement(prev: dict | None, entry: dict) -> dict:
