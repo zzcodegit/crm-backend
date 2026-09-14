@@ -97,6 +97,20 @@ from models import User, Group
 
 router = APIRouter(tags=["references"])
 
+# Песочница админа: одна папка во всех трёх прайсах (склад / RX / МКЛ).
+ADMIN_PRICELIST_FOLDER = "Прайс для админа"
+
+
+def _is_admin_pricelist_folder(group_name: str | None) -> bool:
+    return (group_name or "").strip() == ADMIN_PRICELIST_FOLDER
+
+
+def _force_admin_only_for_folder(group_name: str | None, admin_only: bool | None) -> bool:
+    """Карточки в «Прайс для админа» всегда скрыты от обычных пользователей."""
+    if _is_admin_pricelist_folder(group_name):
+        return True
+    return bool(admin_only)
+
 MANAGER_GROUP_NAME = "Менеджер"
 UPLOADS_DIR = Path("/home/crm-backend/uploads")
 
@@ -1113,14 +1127,19 @@ def delete_coefficient(item_id: int, db: Session = Depends(get_db), _: User = De
 
 # Pricelist groups (группы для прайслиста: Однофокальные, Прогрессивные и т.д.)
 @router.get("/api/ref/pricelist-groups", response_model=list[PricelistGroupResponse])
-def list_pricelist_groups(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return db.query(PricelistGroup).order_by(PricelistGroup.sort_index, PricelistGroup.name).all()
+def list_pricelist_groups(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    query = db.query(PricelistGroup).order_by(PricelistGroup.sort_index, PricelistGroup.name)
+    if not is_admin(current_user):
+        query = query.filter(PricelistGroup.admin_only.is_(False))
+    return query.all()
 
 
 @router.get("/api/ref/pricelist-groups/{item_id}", response_model=PricelistGroupResponse)
-def get_pricelist_group(item_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+def get_pricelist_group(item_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     obj = db.query(PricelistGroup).filter(PricelistGroup.id == item_id).first()
     if not obj:
+        raise HTTPException(status_code=404, detail="Не найдено")
+    if bool(getattr(obj, "admin_only", False)) and not is_admin(current_user):
         raise HTTPException(status_code=404, detail="Не найдено")
     return obj
 
@@ -1136,6 +1155,7 @@ def create_pricelist_group(data: PricelistGroupCreate, db: Session = Depends(get
         display_properties_in_list=data.display_properties_in_list,
         display_as_tiles=data.display_as_tiles,
         tiles_per_page=max(1, min(48, int(data.tiles_per_page))),
+        admin_only=bool(getattr(data, "admin_only", False)),
     )
     db.add(obj)
     db.commit()
@@ -1163,6 +1183,8 @@ def update_pricelist_group(item_id: int, data: PricelistGroupUpdate, db: Session
         obj.display_as_tiles = bool(payload["display_as_tiles"])
     if "tiles_per_page" in payload and payload["tiles_per_page"] is not None:
         obj.tiles_per_page = max(1, min(48, int(payload["tiles_per_page"])))
+    if "admin_only" in payload and payload["admin_only"] is not None:
+        obj.admin_only = bool(payload["admin_only"])
     db.commit()
     db.refresh(obj)
     return obj
@@ -1210,7 +1232,20 @@ def _dict_to_barcode_entry(b: dict) -> BarcodeEntry | None:
             price_val = None
     desc = b.get("description")
     desc = str(desc).strip() if desc else None
-    return BarcodeEntry(code=code, price=price_val, description=desc)
+    sph = b.get("sph")
+    sph = str(sph).strip() if sph is not None and str(sph).strip() else None
+    cyl = b.get("cyl")
+    cyl = str(cyl).strip() if cyl is not None and str(cyl).strip() else None
+    diameters = b.get("diameters")
+    diameters = str(diameters).strip() if diameters is not None and str(diameters).strip() else None
+    return BarcodeEntry(
+        code=code,
+        price=price_val,
+        description=desc,
+        sph=sph,
+        cyl=cyl,
+        diameters=diameters,
+    )
 
 
 def _parse_barcodes_from_db(bcs) -> tuple[list[BarcodeEntry], list[BarcodeSection]]:
@@ -1250,11 +1285,17 @@ def _parse_barcodes_from_db(bcs) -> tuple[list[BarcodeEntry], list[BarcodeSectio
 
 
 def _entry_to_storage_dict(b: BarcodeEntry) -> dict:
-    d = {"code": b.code.strip()}
+    d: dict = {"code": b.code.strip()}
     if b.price is not None:
         d["price"] = b.price
     if b.description:
         d["description"] = b.description
+    if b.sph:
+        d["sph"] = b.sph
+    if b.cyl:
+        d["cyl"] = b.cyl
+    if b.diameters:
+        d["diameters"] = b.diameters
     return d
 
 
@@ -1315,13 +1356,19 @@ def _apply_item_payload_for_update(item, payload: dict) -> None:
         bcs_stored = []
         for b in bcs:
             if isinstance(b, dict) and b.get("code"):
-                bcs_stored.append({"code": str(b["code"]).strip(), "price": b.get("price"), "description": b.get("description")})
+                be = _dict_to_barcode_entry(b)
+                if be:
+                    bcs_stored.append(_entry_to_storage_dict(be))
             elif isinstance(b, BarcodeEntry) and b.code.strip():
-                bcs_stored.append({"code": b.code, "price": b.price, "description": b.description})
+                bcs_stored.append(_entry_to_storage_dict(b))
         upd["barcode"] = bcs_stored[0]["code"] if bcs_stored else None
         upd["barcodes"] = bcs_stored if bcs_stored else None
     for k, v in upd.items():
         setattr(item, k, v)
+    # После применения полей: папка «Прайс для админа» всегда admin_only.
+    group_name = getattr(item, "group", None)
+    if "group" in upd or "admin_only" in upd or _is_admin_pricelist_folder(group_name):
+        item.admin_only = _force_admin_only_for_folder(group_name, getattr(item, "admin_only", False))
 
 
 def _build_item_for_create(item_model, payload: dict):
@@ -1338,10 +1385,13 @@ def _build_item_for_create(item_model, payload: dict):
         bcs_stored = []
         for b in bcs_raw:
             if isinstance(b, dict) and b.get("code"):
-                bcs_stored.append({"code": str(b["code"]).strip(), "price": b.get("price"), "description": b.get("description")})
+                be = _dict_to_barcode_entry(b)
+                if be:
+                    bcs_stored.append(_entry_to_storage_dict(be))
             elif isinstance(b, BarcodeEntry) and b.code.strip():
-                bcs_stored.append({"code": b.code, "price": b.price, "description": b.description})
+                bcs_stored.append(_entry_to_storage_dict(b))
         first_barcode = bcs_stored[0]["code"] if bcs_stored else data.get("barcode")
+    group_name = data.get("group")
     return item_model(
         manufacturer_id=data.get("manufacturer_id"),
         lens_name=data.get("lens_name"),
@@ -1362,7 +1412,7 @@ def _build_item_for_create(item_model, payload: dict):
         uv_protection=data.get("uv_protection", False) or False,
         material=data.get("material"),
         lens_id=data.get("lens_id"),
-        group=data.get("group"),
+        group=group_name,
         coefficient=data.get("coefficient"),
         feature_ids=data.get("feature_ids") or [],
         feature_colors=data.get("feature_colors") or {},
@@ -1370,7 +1420,7 @@ def _build_item_for_create(item_model, payload: dict):
         hide_detail_link=data.get("hide_detail_link", False) or False,
         hide_photo=data.get("hide_photo", False) or False,
         enable_transposition_calc=data.get("enable_transposition_calc", False) or False,
-        admin_only=data.get("admin_only", False) or False,
+        admin_only=_force_admin_only_for_folder(group_name, data.get("admin_only", False)),
     )
 
 
@@ -1501,24 +1551,28 @@ def _pricelist_item_to_response(x: Union[PricelistItem, PricelistRxItem]) -> Pri
 
 
 @router.get("/api/pricelist", response_model=list[PricelistItemResponse])
-def list_pricelist(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+def list_pricelist(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     from sqlalchemy.orm import joinedload
     _apply_pending_pricelist_publications(db)
-    items = (
+    query = (
         db.query(PricelistItem)
         .options(joinedload(PricelistItem.manufacturer))
         .order_by(PricelistItem.group, PricelistItem.sort_index, PricelistItem.id)
-        .all()
     )
+    if not is_admin(current_user):
+        query = query.filter(PricelistItem.admin_only.is_(False))
+    items = query.all()
     return [_pricelist_item_to_response(x) for x in items]
 
 
 @router.get("/api/pricelist/{item_id}", response_model=PricelistItemResponse)
-def get_pricelist_item(item_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+def get_pricelist_item(item_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     from sqlalchemy.orm import joinedload
     _apply_pending_pricelist_publications(db)
     item = db.query(PricelistItem).options(joinedload(PricelistItem.manufacturer)).filter(PricelistItem.id == item_id).first()
     if not item:
+        raise HTTPException(status_code=404, detail="Позиция прайслиста не найдена")
+    if bool(getattr(item, "admin_only", False)) and not is_admin(current_user):
         raise HTTPException(status_code=404, detail="Позиция прайслиста не найдена")
     return _pricelist_item_to_response(item)
 
@@ -1532,7 +1586,7 @@ def create_pricelist_item(data: PricelistItemCreate, db: Session = Depends(get_d
         first_barcode = first_bc or (data.barcode.strip() if data.barcode and str(data.barcode).strip() else None)
     else:
         bcs = data.barcodes if data.barcodes else ([BarcodeEntry(code=data.barcode)] if data.barcode and data.barcode.strip() else [])
-        bcs_stored = [{"code": b.code, "price": b.price, "description": b.description} for b in bcs if b and b.code.strip()]
+        bcs_stored = [_entry_to_storage_dict(b) for b in bcs if b and b.code.strip()]
         first_barcode = bcs_stored[0]["code"] if bcs_stored else data.barcode
     obj = PricelistItem(
         manufacturer_id=data.manufacturer_id,
@@ -1562,7 +1616,7 @@ def create_pricelist_item(data: PricelistItemCreate, db: Session = Depends(get_d
         hide_detail_link=getattr(data, "hide_detail_link", False) or False,
         hide_photo=getattr(data, "hide_photo", False) or False,
         enable_transposition_calc=getattr(data, "enable_transposition_calc", False) or False,
-        admin_only=getattr(data, "admin_only", False) or False,
+        admin_only=_force_admin_only_for_folder(data.group, getattr(data, "admin_only", False)),
     )
     db.add(obj)
     db.commit()
@@ -1587,7 +1641,7 @@ def bulk_create_pricelist_items(
             first_barcode = first_bc or (req.barcode.strip() if req.barcode and str(req.barcode).strip() else None)
         else:
             bcs = req.barcodes if req.barcodes else ([BarcodeEntry(code=req.barcode)] if req.barcode and req.barcode.strip() else [])
-            bcs_stored = [{"code": b.code, "price": b.price, "description": b.description} for b in bcs if b and b.code.strip()]
+            bcs_stored = [_entry_to_storage_dict(b) for b in bcs if b and b.code.strip()]
             first_barcode = bcs_stored[0]["code"] if bcs_stored else req.barcode
 
         obj = PricelistItem(
@@ -1618,7 +1672,7 @@ def bulk_create_pricelist_items(
             hide_detail_link=getattr(req, "hide_detail_link", False) or False,
             hide_photo=getattr(req, "hide_photo", False) or False,
             enable_transposition_calc=getattr(req, "enable_transposition_calc", False) or False,
-            admin_only=getattr(req, "admin_only", False) or False,
+            admin_only=_force_admin_only_for_folder(req.group, getattr(req, "admin_only", False)),
         )
         db.add(obj)
         db.flush()
@@ -1789,7 +1843,7 @@ def create_pricelist_rx_item(data: PricelistItemCreate, db: Session = Depends(ge
         first_barcode = first_bc or (data.barcode.strip() if data.barcode and str(data.barcode).strip() else None)
     else:
         bcs = data.barcodes if data.barcodes else ([BarcodeEntry(code=data.barcode)] if data.barcode and data.barcode.strip() else [])
-        bcs_stored = [{"code": b.code, "price": b.price, "description": b.description} for b in bcs if b and b.code.strip()]
+        bcs_stored = [_entry_to_storage_dict(b) for b in bcs if b and b.code.strip()]
         first_barcode = bcs_stored[0]["code"] if bcs_stored else data.barcode
     obj = PricelistRxItem(
         manufacturer_id=data.manufacturer_id,
@@ -1819,7 +1873,7 @@ def create_pricelist_rx_item(data: PricelistItemCreate, db: Session = Depends(ge
         hide_detail_link=getattr(data, "hide_detail_link", False) or False,
         hide_photo=getattr(data, "hide_photo", False) or False,
         enable_transposition_calc=getattr(data, "enable_transposition_calc", False) or False,
-        admin_only=getattr(data, "admin_only", False) or False,
+        admin_only=_force_admin_only_for_folder(data.group, getattr(data, "admin_only", False)),
     )
     db.add(obj)
     db.commit()
@@ -1845,7 +1899,7 @@ def bulk_create_pricelist_rx_items(
             first_barcode = first_bc or (req.barcode.strip() if req.barcode and str(req.barcode).strip() else None)
         else:
             bcs = req.barcodes if req.barcodes else ([BarcodeEntry(code=req.barcode)] if req.barcode and req.barcode.strip() else [])
-            bcs_stored = [{"code": b.code, "price": b.price, "description": b.description} for b in bcs if b and b.code.strip()]
+            bcs_stored = [_entry_to_storage_dict(b) for b in bcs if b and b.code.strip()]
             first_barcode = bcs_stored[0]["code"] if bcs_stored else req.barcode
 
         obj = PricelistRxItem(
@@ -1876,7 +1930,7 @@ def bulk_create_pricelist_rx_items(
             hide_detail_link=getattr(req, "hide_detail_link", False) or False,
             hide_photo=getattr(req, "hide_photo", False) or False,
             enable_transposition_calc=getattr(req, "enable_transposition_calc", False) or False,
-            admin_only=getattr(req, "admin_only", False) or False,
+            admin_only=_force_admin_only_for_folder(req.group, getattr(req, "admin_only", False)),
         )
         db.add(obj)
         db.flush()
@@ -1940,14 +1994,19 @@ def delete_pricelist_rx_item(item_id: int, db: Session = Depends(get_db), _: Use
 
 
 @router.get("/api/ref/pricelist-mkl-groups", response_model=list[PricelistGroupResponse])
-def list_pricelist_mkl_groups(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return db.query(PricelistMklGroup).order_by(PricelistMklGroup.sort_index, PricelistMklGroup.name).all()
+def list_pricelist_mkl_groups(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    query = db.query(PricelistMklGroup).order_by(PricelistMklGroup.sort_index, PricelistMklGroup.name)
+    if not is_admin(current_user):
+        query = query.filter(PricelistMklGroup.admin_only.is_(False))
+    return query.all()
 
 
 @router.get("/api/ref/pricelist-mkl-groups/{item_id}", response_model=PricelistGroupResponse)
-def get_pricelist_mkl_group(item_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+def get_pricelist_mkl_group(item_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     obj = db.query(PricelistMklGroup).filter(PricelistMklGroup.id == item_id).first()
     if not obj:
+        raise HTTPException(status_code=404, detail="Не найдено")
+    if bool(getattr(obj, "admin_only", False)) and not is_admin(current_user):
         raise HTTPException(status_code=404, detail="Не найдено")
     return obj
 
@@ -1963,6 +2022,7 @@ def create_pricelist_mkl_group(data: PricelistGroupCreate, db: Session = Depends
         display_properties_in_list=data.display_properties_in_list,
         display_as_tiles=data.display_as_tiles,
         tiles_per_page=max(1, min(48, int(data.tiles_per_page))),
+        admin_only=bool(getattr(data, "admin_only", False)),
     )
     db.add(obj)
     db.commit()
@@ -1990,6 +2050,8 @@ def update_pricelist_mkl_group(item_id: int, data: PricelistGroupUpdate, db: Ses
         obj.display_as_tiles = bool(payload["display_as_tiles"])
     if "tiles_per_page" in payload and payload["tiles_per_page"] is not None:
         obj.tiles_per_page = max(1, min(48, int(payload["tiles_per_page"])))
+    if "admin_only" in payload and payload["admin_only"] is not None:
+        obj.admin_only = bool(payload["admin_only"])
     db.commit()
     db.refresh(obj)
     return obj
@@ -2041,7 +2103,7 @@ def create_pricelist_mkl_item(data: PricelistItemCreate, db: Session = Depends(g
         first_barcode = first_bc or (data.barcode.strip() if data.barcode and str(data.barcode).strip() else None)
     else:
         bcs = data.barcodes if data.barcodes else ([BarcodeEntry(code=data.barcode)] if data.barcode and data.barcode.strip() else [])
-        bcs_stored = [{"code": b.code, "price": b.price, "description": b.description} for b in bcs if b and b.code.strip()]
+        bcs_stored = [_entry_to_storage_dict(b) for b in bcs if b and b.code.strip()]
         first_barcode = bcs_stored[0]["code"] if bcs_stored else data.barcode
     obj = PricelistMklItem(
         manufacturer_id=data.manufacturer_id,
@@ -2071,7 +2133,7 @@ def create_pricelist_mkl_item(data: PricelistItemCreate, db: Session = Depends(g
         hide_detail_link=getattr(data, "hide_detail_link", False) or False,
         hide_photo=getattr(data, "hide_photo", False) or False,
         enable_transposition_calc=getattr(data, "enable_transposition_calc", False) or False,
-        admin_only=getattr(data, "admin_only", False) or False,
+        admin_only=_force_admin_only_for_folder(data.group, getattr(data, "admin_only", False)),
     )
     db.add(obj)
     db.commit()
@@ -2097,7 +2159,7 @@ def bulk_create_pricelist_mkl_items(
             first_barcode = first_bc or (req.barcode.strip() if req.barcode and str(req.barcode).strip() else None)
         else:
             bcs = req.barcodes if req.barcodes else ([BarcodeEntry(code=req.barcode)] if req.barcode and req.barcode.strip() else [])
-            bcs_stored = [{"code": b.code, "price": b.price, "description": b.description} for b in bcs if b and b.code.strip()]
+            bcs_stored = [_entry_to_storage_dict(b) for b in bcs if b and b.code.strip()]
             first_barcode = bcs_stored[0]["code"] if bcs_stored else req.barcode
 
         obj = PricelistMklItem(
@@ -2128,7 +2190,7 @@ def bulk_create_pricelist_mkl_items(
             hide_detail_link=getattr(req, "hide_detail_link", False) or False,
             hide_photo=getattr(req, "hide_photo", False) or False,
             enable_transposition_calc=getattr(req, "enable_transposition_calc", False) or False,
-            admin_only=getattr(req, "admin_only", False) or False,
+            admin_only=_force_admin_only_for_folder(req.group, getattr(req, "admin_only", False)),
         )
         db.add(obj)
         db.flush()

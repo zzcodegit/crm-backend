@@ -1,5 +1,8 @@
 """Выплаты из центральной кассы сотрудникам (учёт для администратора)."""
 
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 
@@ -9,6 +12,12 @@ from models import User, CentralCashPayout, TakenSource
 from schemas import CentralCashPayoutCreate, CentralCashPayoutUpdate, CentralCashPayoutResponse
 
 router = APIRouter(prefix="/api/central-cash-payouts", tags=["central-cash"])
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+
+def _today_moscow() -> date:
+    return datetime.now(MOSCOW_TZ).date()
 
 
 def _user_display_name(u: User | None) -> str:
@@ -20,9 +29,16 @@ def _user_display_name(u: User | None) -> str:
 
 
 def _payout_to_response(r: CentralCashPayout) -> CentralCashPayoutResponse:
+    bed = r.balance_effective_date
+    if bed is None and r.created_at is not None:
+        ts = r.created_at
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=MOSCOW_TZ)
+        bed = ts.astimezone(MOSCOW_TZ).date()
     return CentralCashPayoutResponse(
         id=r.id,
         created_at=r.created_at,
+        balance_effective_date=bed or _today_moscow(),
         paid_to_user_id=r.paid_to_user_id,
         paid_to_name=_user_display_name(r.paid_to),
         amount=float(r.amount),
@@ -50,6 +66,17 @@ def _load_payout(db: Session, payout_id: int) -> CentralCashPayout:
     return row
 
 
+def _parse_balance_date(value: date | None) -> date:
+    if value is None:
+        return _today_moscow()
+    if value.year < 2020 or value.year > _today_moscow().year + 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Дата пополнения баланса вне допустимого диапазона",
+        )
+    return value
+
+
 @router.get("", response_model=list[CentralCashPayoutResponse])
 def list_central_cash_payouts(
     db: Session = Depends(get_db),
@@ -62,7 +89,11 @@ def list_central_cash_payouts(
             joinedload(CentralCashPayout.recorded_by),
             joinedload(CentralCashPayout.taken_source),
         )
-        .order_by(CentralCashPayout.created_at.desc(), CentralCashPayout.id.desc())
+        .order_by(
+            CentralCashPayout.balance_effective_date.desc(),
+            CentralCashPayout.created_at.desc(),
+            CentralCashPayout.id.desc(),
+        )
         .all()
     )
     return [_payout_to_response(r) for r in rows]
@@ -85,12 +116,14 @@ def create_central_cash_payout(
         src = db.query(TakenSource).filter(TakenSource.id == data.taken_source_id).first()
         if not src:
             raise HTTPException(status_code=400, detail="Способ выдачи не найден")
+    bed = _parse_balance_date(data.balance_effective_date)
     obj = CentralCashPayout(
         paid_to_user_id=data.paid_to_user_id,
         amount=data.amount,
         taken_source_id=data.taken_source_id,
         note=(data.note or "").strip() or None,
         recorded_by_user_id=current_user.id,
+        balance_effective_date=bed,
     )
     db.add(obj)
     db.commit()
@@ -132,6 +165,9 @@ def update_central_cash_payout(
     if "note" in payload:
         note = payload["note"]
         row.note = (str(note).strip() if note is not None else "") or None
+    if "balance_effective_date" in payload:
+        # Пустая/null → сегодня (Europe/Moscow)
+        row.balance_effective_date = _parse_balance_date(payload["balance_effective_date"])
     db.commit()
     return _payout_to_response(_load_payout(db, payout_id))
 

@@ -248,10 +248,13 @@ class PricelistGroupUpdate(BaseModel):
 
 
 class BarcodeEntry(BaseModel):
-    """Штрихкод с опциональными ценой и описанием."""
+    """Штрихкод с опциональными ценой, описанием и параметрами линзы."""
     code: str
     price: float | None = None
     description: str | None = None
+    sph: str | None = None
+    cyl: str | None = None
+    diameters: str | None = None
 
 
 class BarcodeSection(BaseModel):
@@ -314,7 +317,20 @@ def _normalize_barcode(v: str | dict) -> BarcodeEntry:
                 price_val = None
         desc = v.get("description")
         desc = str(desc).strip() if desc is not None and desc != "" else None
-        return BarcodeEntry(code=code, price=price_val, description=desc)
+        sph = v.get("sph")
+        sph = str(sph).strip() if sph is not None and str(sph).strip() else None
+        cyl = v.get("cyl")
+        cyl = str(cyl).strip() if cyl is not None and str(cyl).strip() else None
+        diameters = v.get("diameters")
+        diameters = str(diameters).strip() if diameters is not None and str(diameters).strip() else None
+        return BarcodeEntry(
+            code=code,
+            price=price_val,
+            description=desc,
+            sph=sph,
+            cyl=cyl,
+            diameters=diameters,
+        )
     raise ValueError("barcode must be str or dict")
 
 
@@ -1929,6 +1945,8 @@ class CentralCashPayoutCreate(BaseModel):
     amount: float
     taken_source_id: int | None = None
     note: str | None = None
+    # Дата пополнения баланса (YYYY-MM-DD). Если не указана — сегодня (Europe/Moscow).
+    balance_effective_date: date_type | None = None
 
 
 class CentralCashPayoutUpdate(BaseModel):
@@ -1938,11 +1956,13 @@ class CentralCashPayoutUpdate(BaseModel):
     amount: float | None = None
     taken_source_id: int | None = None
     note: str | None = None
+    balance_effective_date: date_type | None = None
 
 
 class CentralCashPayoutResponse(BaseModel):
     id: int
     created_at: datetime
+    balance_effective_date: date_type
     paid_to_user_id: int
     paid_to_name: str = ""
     amount: float

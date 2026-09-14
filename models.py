@@ -201,6 +201,7 @@ class PricelistGroup(Base):
     display_properties_in_list = Column(Boolean, default=True, nullable=False)
     display_as_tiles = Column(Boolean, default=False, nullable=False)
     tiles_per_page = Column(Integer, default=4, nullable=False)
+    admin_only = Column(Boolean, default=False, nullable=False)
 
 
 class PricelistItem(Base):
@@ -307,6 +308,7 @@ class PricelistMklGroup(Base):
     display_properties_in_list = Column(Boolean, default=True, nullable=False)
     display_as_tiles = Column(Boolean, default=False, nullable=False)
     tiles_per_page = Column(Integer, default=4, nullable=False)
+    admin_only = Column(Boolean, default=False, nullable=False)
 
 
 class PricelistMklItem(Base):
@@ -769,6 +771,8 @@ class CentralCashPayout(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # Календарный день, с которого сумма доступна на балансе сотрудника (FIFO «Взято»).
+    balance_effective_date = Column(Date, nullable=False, index=True)
     paid_to_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     amount = Column(Numeric(15, 2), nullable=False)
     taken_source_id = Column(Integer, ForeignKey("taken_sources.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -815,11 +819,19 @@ class ManualWithholding(Base):
     closed = Column(Boolean, default=False, nullable=False)
     closed_at = Column(DateTime(timezone=True), nullable=True)
     closed_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # Пока False — видно только админу на /reports/withholding; в ЛК сотрудника не попадает.
+    published_to_lk = Column(Boolean, default=False, nullable=False, index=True)
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    published_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # Отчёт, указанный админом в форме («Забрано в отчёте»).
+    linked_report_id = Column(Integer, ForeignKey("daily_reports.id", ondelete="SET NULL"), nullable=True, index=True)
 
     user = relationship("User", foreign_keys=[user_id])
     warehouse = relationship("Warehouse", foreign_keys=[warehouse_id])
     recorded_by = relationship("User", foreign_keys=[recorded_by_user_id])
     closed_by = relationship("User", foreign_keys=[closed_by_user_id])
+    published_by = relationship("User", foreign_keys=[published_by_user_id])
+    linked_report = relationship("DailyReport", foreign_keys=[linked_report_id])
 
 
 class WorkScheduleDraft(Base):

@@ -8,6 +8,7 @@ from datetime import date as date_type, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import and_, func, or_
@@ -791,6 +792,7 @@ class ManualWithholdingCreate(BaseModel):
     report_month: str | None = None
     reason: str | None = None
     note: str | None = None
+    linked_report_id: int | None = None
 
 
 class ManualDebtWithholdBody(BaseModel):
@@ -810,6 +812,8 @@ class ManualWithholdingUpdate(BaseModel):
     report_month: str | None = None
     reason: str | None = None
     note: str | None = None
+    # None — не менять; 0 или отрицательное — сбросить связь с отчётом
+    linked_report_id: int | None = None
 
 
 class ManualWithholdingItem(BaseModel):
@@ -829,10 +833,301 @@ class ManualWithholdingItem(BaseModel):
     closed_at: datetime | None = None
     closed_by_user_id: int | None = None
     closed_by_name: str | None = None
+    published_to_lk: bool = False
+    published_at: datetime | None = None
+    published_by_user_id: int | None = None
+    published_by_name: str | None = None
+    # Погашение в сменном отчёте (сумма по всем отчётам; ссылка — на последний)
+    taken_in_report: float = 0.0
+    taken_report_id: int | None = None
+    taken_report_at: datetime | None = None
+    # Отчёт, выбранный админом в форме («Забрано в отчёте»)
+    linked_report_id: int | None = None
 
 
 class ManualWithholdingResponse(BaseModel):
     rows: list[ManualWithholdingItem]
+
+
+class ManualWithholdingPublishBulkBody(BaseModel):
+    """Массовая отправка удержаний в ЛК сотрудников."""
+
+    ids: list[int] = Field(default_factory=list)
+
+
+class WithholdingReportOption(BaseModel):
+    id: int
+    at: datetime | None = None
+    warehouse_name: str | None = None
+    label: str
+
+
+class WithholdingReportOptionsResponse(BaseModel):
+    rows: list[WithholdingReportOption]
+
+
+
+def _user_short_name(u: User | None, fallback: str = "—") -> str:
+    if u is None:
+        return fallback
+    return (u.last_name or u.first_name or u.username or fallback)
+
+
+def _manual_withholding_to_item(
+    r: ManualWithholding,
+    *,
+    user_name: str | None = None,
+    warehouse_name: str | None = None,
+    recorded_by_name: str | None = None,
+    closed_by_name: str | None = None,
+    published_by_name: str | None = None,
+    taken_in_report: float = 0.0,
+    taken_report_id: int | None = None,
+    taken_report_at: datetime | None = None,
+) -> ManualWithholdingItem:
+    linked_id = getattr(r, "linked_report_id", None)
+    try:
+        linked_id_i = int(linked_id) if linked_id is not None else None
+    except (TypeError, ValueError):
+        linked_id_i = None
+    if linked_id_i is not None and linked_id_i <= 0:
+        linked_id_i = None
+    return ManualWithholdingItem(
+        id=r.id,
+        created_at=r.created_at,
+        user_id=r.user_id,
+        user_name=user_name or f"ID {r.user_id}",
+        amount=float(r.amount or 0),
+        warehouse_id=r.warehouse_id,
+        warehouse_name=warehouse_name,
+        report_month=r.report_month,
+        reason=r.reason,
+        note=r.note,
+        recorded_by_user_id=r.recorded_by_user_id,
+        recorded_by_name=recorded_by_name,
+        closed=bool(getattr(r, "closed", False)),
+        closed_at=getattr(r, "closed_at", None),
+        closed_by_user_id=getattr(r, "closed_by_user_id", None),
+        closed_by_name=closed_by_name,
+        published_to_lk=bool(getattr(r, "published_to_lk", False)),
+        published_at=getattr(r, "published_at", None),
+        published_by_user_id=getattr(r, "published_by_user_id", None),
+        published_by_name=published_by_name,
+        taken_in_report=float(taken_in_report or 0),
+        taken_report_id=taken_report_id,
+        taken_report_at=taken_report_at,
+        linked_report_id=linked_id_i,
+    )
+
+
+def _validate_withholding_linked_report(
+    db: Session, *, report_id: int | None, user_id: int
+) -> DailyReport | None:
+    """Проверка отчёта для поля «Забрано в отчёте»; None = связи нет."""
+    if report_id is None:
+        return None
+    try:
+        rid = int(report_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Некорректный id отчёта")
+    if rid <= 0:
+        return None
+    rep = (
+        db.query(DailyReport)
+        .filter(DailyReport.id == rid, DailyReport.is_draft.is_(False))
+        .first()
+    )
+    if not rep:
+        raise HTTPException(status_code=400, detail="Отчёт не найден")
+    if int(rep.user_id) != int(user_id):
+        raise HTTPException(status_code=400, detail="Отчёт принадлежит другому сотруднику")
+    return rep
+
+
+def _report_option_label(rep: DailyReport, warehouse_name: str | None = None) -> str:
+    ts = getattr(rep, "submitted_at", None) or rep.created_at
+    day = "—"
+    if ts is not None:
+        try:
+            day = ts.astimezone(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y")
+        except Exception:
+            day = ts.strftime("%d.%m.%Y")
+    wh = warehouse_name or (rep.warehouse.name if getattr(rep, "warehouse", None) is not None else None)
+    if wh:
+        return f"#{rep.id} · {day} · {wh}"
+    return f"#{rep.id} · {day}"
+
+
+def _taken_fields_for_withholding(
+    r: ManualWithholding,
+    *,
+    auto_taken: dict | None,
+    linked_report: DailyReport | None,
+) -> tuple[float, int | None, datetime | None]:
+    """Приоритет: ручная связь с отчётом, иначе авто из отчётов/заметок."""
+    auto = auto_taken or {}
+    auto_amt = float(auto.get("amount") or 0)
+    auto_rid = auto.get("report_id")
+    auto_at = auto.get("report_at")
+    if linked_report is not None:
+        rid = int(linked_report.id)
+        at = getattr(linked_report, "submitted_at", None) or linked_report.created_at
+        amt = auto_amt if auto_amt > DEBT_AMOUNT_EPS else float(r.amount or 0)
+        return amt, rid, at
+    try:
+        auto_rid_i = int(auto_rid) if auto_rid is not None else None
+    except (TypeError, ValueError):
+        auto_rid_i = None
+    return auto_amt, auto_rid_i, auto_at
+
+
+_NOTE_WITHHOLDING_TAKEN_RE = re.compile(
+    r"Погашено\s+отч[её]том\s+#(\d+)(?:\s*\(−\s*([0-9]+(?:[.,][0-9]+)?)\s*₽\))?",
+    re.IGNORECASE,
+)
+
+
+def _parse_taken_events_from_withholding_note(note: str | None) -> list[tuple[int, float | None]]:
+    """Из комментария удержания: [(report_id, amount|None), ...] по фразам «Погашено отчётом #N»."""
+    if not note:
+        return []
+    out: list[tuple[int, float | None]] = []
+    for m in _NOTE_WITHHOLDING_TAKEN_RE.finditer(str(note)):
+        try:
+            rid = int(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        if rid <= 0:
+            continue
+        amt: float | None = None
+        if m.group(2):
+            try:
+                amt = float(str(m.group(2)).replace(",", ".").replace(" ", ""))
+            except (TypeError, ValueError):
+                amt = None
+        out.append((rid, amt))
+    return out
+
+
+def _withholding_taken_from_reports_index(db: Session) -> dict[int, dict]:
+    """
+    По отправленным отчётам (withholding_details): withholding_id ->
+    {amount, report_id, report_at} — сумма и последний отчёт.
+    """
+    # В БД часто лежит jsonb null (колонка NOT NULL на уровне SQL, значение JSON null).
+    # jsonb_array_length на scalar падает — фильтруем в Python.
+    reports = (
+        db.query(DailyReport)
+        .filter(
+            DailyReport.is_draft.is_(False),
+            DailyReport.withholding_details.isnot(None),
+        )
+        .all()
+    )
+    index: dict[int, dict] = {}
+    for report in reports:
+        raw = getattr(report, "withholding_details", None)
+        if not isinstance(raw, list) or not raw:
+            continue
+        applied = _withholding_applied_map(raw)
+        if not applied:
+            continue
+        ts = getattr(report, "submitted_at", None) or report.created_at
+        for wid, amt in applied.items():
+            cur = index.get(wid)
+            if cur is None:
+                index[wid] = {
+                    "amount": float(amt),
+                    "report_id": int(report.id),
+                    "report_at": ts,
+                }
+                continue
+            cur["amount"] = round(float(cur["amount"]) + float(amt), 2)
+            cur_ts = cur.get("report_at")
+            if ts is not None and (
+                cur_ts is None
+                or ts > cur_ts
+                or (ts == cur_ts and int(report.id) >= int(cur["report_id"]))
+            ):
+                cur["report_id"] = int(report.id)
+                cur["report_at"] = ts
+    return index
+
+
+def _enrich_withholding_taken_from_notes(
+    db: Session,
+    rows: list[ManualWithholding],
+    taken_idx: dict[int, dict],
+) -> dict[int, dict]:
+    """
+    Дополняет индекс погашений из note («Погашено отчётом #…»),
+    т.к. исторически withholding_details в отчётах часто пустые.
+    """
+    need_report_ids: set[int] = set()
+    parsed_by_wid: dict[int, list[tuple[int, float | None]]] = {}
+    for r in rows:
+        wid = int(r.id)
+        cur = taken_idx.get(wid)
+        if cur and float(cur.get("amount") or 0) > DEBT_AMOUNT_EPS and cur.get("report_id"):
+            continue
+        events = _parse_taken_events_from_withholding_note(getattr(r, "note", None))
+        if not events:
+            continue
+        parsed_by_wid[wid] = events
+        for rid, _ in events:
+            need_report_ids.add(int(rid))
+
+    report_ts: dict[int, datetime | None] = {}
+    if need_report_ids:
+        for rep in (
+            db.query(DailyReport.id, DailyReport.submitted_at, DailyReport.created_at)
+            .filter(DailyReport.id.in_(list(need_report_ids)))
+            .all()
+        ):
+            report_ts[int(rep.id)] = getattr(rep, "submitted_at", None) or getattr(rep, "created_at", None)
+
+    out = dict(taken_idx)
+    for r in rows:
+        wid = int(r.id)
+        if wid in out and float(out[wid].get("amount") or 0) > DEBT_AMOUNT_EPS and out[wid].get("report_id"):
+            continue
+        events = parsed_by_wid.get(wid) or []
+        if not events:
+            continue
+        known_amts = [float(a) for _, a in events if a is not None and float(a) > DEBT_AMOUNT_EPS]
+        if known_amts and len(known_amts) == len(events):
+            taken_amt = round(sum(known_amts), 2)
+        elif bool(getattr(r, "closed", False)):
+            taken_amt = round(float(r.amount or 0), 2)
+        elif known_amts:
+            taken_amt = round(sum(known_amts), 2)
+        else:
+            taken_amt = round(float(r.amount or 0), 2) if bool(getattr(r, "closed", False)) else 0.0
+
+        last_rid = int(events[-1][0])
+        last_ts = report_ts.get(last_rid)
+        # если у последнего нет даты — ищем любой с датой с конца
+        if last_ts is None:
+            for rid, _ in reversed(events):
+                ts = report_ts.get(int(rid))
+                if ts is not None:
+                    last_rid = int(rid)
+                    last_ts = ts
+                    break
+        out[wid] = {
+            "amount": taken_amt,
+            "report_id": last_rid if last_rid > 0 else None,
+            "report_at": last_ts,
+        }
+    return out
+
+
+def _publish_withholding_row(obj: ManualWithholding, current_user: User) -> None:
+    if bool(getattr(obj, "published_to_lk", False)):
+        return
+    obj.published_to_lk = True
+    obj.published_at = datetime.now(timezone.utc)
+    obj.published_by_user_id = current_user.id
 
 
 def _build_taken_amounts_by_debt_uid(
@@ -1111,6 +1406,11 @@ def _apply_withholding_details_delta(
         )
         if row is None:
             raise HTTPException(status_code=400, detail=f"Удержание #{wid} не найдено")
+        if delta > DEBT_AMOUNT_EPS and not bool(getattr(row, "published_to_lk", False)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Удержание #{wid} ещё не отправлено в ЛК",
+            )
         current_open = 0.0 if bool(row.closed) else float(row.amount or 0)
         if delta > DEBT_AMOUNT_EPS and delta > current_open + DEBT_AMOUNT_EPS:
             raise HTTPException(
@@ -1631,11 +1931,41 @@ def _vzyala_totals_for_user(db: Session, user_id: int) -> tuple[float, float]:
     return total, linked
 
 
-def _central_cash_issued_for_user(db: Session, user_id: int) -> float:
-    """Сумма выплат сотруднику из центральной кассы."""
+def _moscow_tz():
+    return ZoneInfo("Europe/Moscow")
+
+
+def _today_moscow() -> date_type:
+    return datetime.now(_moscow_tz()).date()
+
+
+def _moscow_calendar_date(ts: datetime | None) -> date_type | None:
+    """Календарный день в Europe/Moscow."""
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(_moscow_tz()).date()
+
+
+def _payout_balance_date(p: CentralCashPayout) -> date_type:
+    """День, с которого выплата доступна на балансе сотрудника."""
+    bed = getattr(p, "balance_effective_date", None)
+    if bed is not None:
+        return bed
+    return _moscow_calendar_date(getattr(p, "created_at", None)) or date_type.min
+
+
+def _central_cash_issued_for_user(
+    db: Session, user_id: int, *, as_of: date_type | None = None
+) -> float:
+    """Сумма выплат сотруднику из ЦК (дата пополнения ≤ as_of; по умолчанию — сегодня)."""
+    cutoff = as_of if as_of is not None else _today_moscow()
     rows = db.query(CentralCashPayout).filter(CentralCashPayout.paid_to_user_id == user_id).all()
     total = 0.0
     for row in rows:
+        if _payout_balance_date(row) > cutoff:
+            continue
         try:
             total += float(row.amount) if row.amount is not None else 0.0
         except (TypeError, ValueError):
@@ -1644,10 +1974,15 @@ def _central_cash_issued_for_user(db: Session, user_id: int) -> float:
 
 
 def _open_manual_withholding_rows(db: Session, user_id: int) -> list[ManualWithholding]:
+    """Открытые удержания, уже отправленные в ЛК (для блока отчёта сотрудника)."""
     return (
         db.query(ManualWithholding)
         .options(joinedload(ManualWithholding.warehouse))
-        .filter(ManualWithholding.user_id == user_id, ManualWithholding.closed.is_(False))
+        .filter(
+            ManualWithholding.user_id == user_id,
+            ManualWithholding.closed.is_(False),
+            ManualWithholding.published_to_lk.is_(True),
+        )
         .order_by(ManualWithholding.created_at.desc(), ManualWithholding.id.desc())
         .all()
     )
@@ -1693,7 +2028,11 @@ def _cc_pool_balance_before_by_report_id(
     """Остаток ЦК до «Взято» каждого отчёта — один проход FIFO на сотрудника (без N+1)."""
     payouts = (
         db.query(CentralCashPayout)
-        .order_by(CentralCashPayout.created_at.asc(), CentralCashPayout.id.asc())
+        .order_by(
+            CentralCashPayout.balance_effective_date.asc(),
+            CentralCashPayout.created_at.asc(),
+            CentralCashPayout.id.asc(),
+        )
         .all()
     )
     payouts_by_user: dict[int, list[CentralCashPayout]] = defaultdict(list)
@@ -1714,23 +2053,28 @@ def _cc_pool_balance_before_by_report_id(
         )
         ups = payouts_by_user.get(user_id, [])
         pools = [float(p.amount or 0) for p in ups]
-        payout_ats = [p.created_at for p in ups]
+        payout_days = [_payout_balance_date(p) for p in ups]
         issued = sum(pools)
         if issued <= DEBT_AMOUNT_EPS:
             for report in user_reports:
                 out[report.id] = 0.0
             continue
         for report in user_reports:
-            out[report.id] = sum(max(0.0, p) for p in pools)
             ts = getattr(report, "submitted_at", None) or report.created_at
-            if not ts:
+            report_day = _moscow_calendar_date(ts)
+            if report_day is None:
+                out[report.id] = 0.0
                 continue
+            # Только выплаты, уже доступные на день отчёта (не будущие по дате пополнения).
+            out[report.id] = sum(
+                max(0.0, pools[i]) for i, d in enumerate(payout_days) if d <= report_day
+            )
             vsum = _vzyala_amount_for_report(report)
             if vsum <= DEBT_AMOUNT_EPS:
                 continue
             remaining = vsum
-            for i, payout_at in enumerate(payout_ats):
-                if payout_at and ts < payout_at:
+            for i, pay_day in enumerate(payout_days):
+                if report_day < pay_day:
                     continue
                 take = min(remaining, pools[i])
                 pools[i] -= take
@@ -1745,17 +2089,32 @@ def _employee_salary_balance(
 ) -> EmployeeSalaryBalanceResponse:
     """
     Остаток выплат из центральной кассы.
-    «Взято» списывается только из отчётов, отправленных не раньше соответствующей выплаты (FIFO по датам).
+    «Взято» списывается из отчётов за день ≥ даты пополнения баланса (FIFO).
     Старые отчёты до первой выплаты ЦК пул не уменьшают.
     Ручные удержания (/reports/withholding) на баланс не влияют — погашаются отдельным блоком в отчёте.
     """
+    as_of = _today_moscow()
+    if exclude_report_id is not None:
+        excl = db.query(DailyReport).filter(DailyReport.id == exclude_report_id).first()
+        if excl is not None:
+            excl_day = _moscow_calendar_date(
+                getattr(excl, "submitted_at", None) or excl.created_at
+            )
+            if excl_day is not None:
+                as_of = excl_day
+
     payouts = (
         db.query(CentralCashPayout)
         .filter(CentralCashPayout.paid_to_user_id == user_id)
-        .order_by(CentralCashPayout.created_at.asc(), CentralCashPayout.id.asc())
+        .order_by(
+            CentralCashPayout.balance_effective_date.asc(),
+            CentralCashPayout.created_at.asc(),
+            CentralCashPayout.id.asc(),
+        )
         .all()
     )
-    issued = _central_cash_issued_for_user(db, user_id)
+    eligible = [p for p in payouts if _payout_balance_date(p) <= as_of]
+    issued = sum(float(p.amount or 0) for p in eligible)
     withholdings, withholding_items = _open_manual_withholdings_sum_and_items(db, user_id)
 
     if issued <= DEBT_AMOUNT_EPS:
@@ -1768,8 +2127,8 @@ def _employee_salary_balance(
             balance=0.0,
         )
 
-    pools = [float(p.amount) for p in payouts]
-    payout_ats = [p.created_at for p in payouts]
+    pools = [float(p.amount) for p in eligible]
+    payout_days = [_payout_balance_date(p) for p in eligible]
 
     reports = (
         db.query(DailyReport)
@@ -1782,14 +2141,15 @@ def _employee_salary_balance(
         if exclude_report_id is not None and report.id == exclude_report_id:
             continue
         ts = getattr(report, "submitted_at", None) or report.created_at
-        if not ts:
+        report_day = _moscow_calendar_date(ts)
+        if report_day is None:
             continue
         vsum = _vzyala_amount_for_report(report)
         if vsum <= DEBT_AMOUNT_EPS:
             continue
         remaining = vsum
-        for i, payout_at in enumerate(payout_ats):
-            if payout_at and ts < payout_at:
+        for i, pay_day in enumerate(payout_days):
+            if report_day < pay_day:
                 continue
             take = min(remaining, pools[i])
             pools[i] -= take
@@ -2257,31 +2617,23 @@ def withhold_manual_employee_debt(
         reason=reason,
         note=note,
         recorded_by_user_id=current_user.id,
+        published_to_lk=True,
+        published_at=datetime.now(timezone.utc),
+        published_by_user_id=current_user.id,
     )
     db.add(obj)
     db.commit()
     db.refresh(obj)
     user = db.query(User).filter(User.id == obj.user_id).first()
-    user_name = (user.last_name or user.first_name or user.username) if user else f"ID {obj.user_id}"
-    rec_name = current_user.last_name or current_user.first_name or current_user.username
+    user_name = _user_short_name(user, f"ID {obj.user_id}")
+    rec_name = _user_short_name(current_user)
     wh_name = m.warehouse.name if m.warehouse is not None else None
-    return ManualWithholdingItem(
-        id=obj.id,
-        created_at=obj.created_at,
-        user_id=obj.user_id,
+    return _manual_withholding_to_item(
+        obj,
         user_name=user_name,
-        amount=float(obj.amount or 0),
-        warehouse_id=obj.warehouse_id,
         warehouse_name=wh_name,
-        report_month=obj.report_month,
-        reason=obj.reason,
-        note=obj.note,
-        recorded_by_user_id=obj.recorded_by_user_id,
         recorded_by_name=rec_name,
-        closed=bool(getattr(obj, "closed", False)),
-        closed_at=getattr(obj, "closed_at", None),
-        closed_by_user_id=getattr(obj, "closed_by_user_id", None),
-        closed_by_name=None,
+        published_by_name=rec_name,
     )
 
 
@@ -2699,6 +3051,39 @@ def get_my_taken_summary(
     return TakenSummaryResponse(rows=[r for r in rows if r.user_id == user.id])
 
 
+@router.get("/withholding/report-options", response_model=WithholdingReportOptionsResponse)
+def withholding_report_options(
+    user_id: int = Query(..., description="Сотрудник — отчёты только этого пользователя"),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_admin_user),
+):
+    """Список отчётов сотрудника для поля «Забрано в отчёте»."""
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
+    reports = (
+        db.query(DailyReport)
+        .options(joinedload(DailyReport.warehouse))
+        .filter(DailyReport.user_id == int(user_id), DailyReport.is_draft.is_(False))
+        .order_by(func.coalesce(DailyReport.submitted_at, DailyReport.created_at).desc(), DailyReport.id.desc())
+        .limit(200)
+        .all()
+    )
+    rows: list[WithholdingReportOption] = []
+    for rep in reports:
+        wh_name = rep.warehouse.name if rep.warehouse is not None else None
+        ts = getattr(rep, "submitted_at", None) or rep.created_at
+        rows.append(
+            WithholdingReportOption(
+                id=int(rep.id),
+                at=ts,
+                warehouse_name=wh_name,
+                label=_report_option_label(rep, wh_name),
+            )
+        )
+    return WithholdingReportOptionsResponse(rows=rows)
+
+
 @router.get("/withholding/summary", response_model=ManualWithholdingResponse)
 def withholding_summary(
     db: Session = Depends(get_db),
@@ -2713,36 +3098,56 @@ def withholding_summary(
         {r.user_id for r in rows_db if r.user_id}
         | {r.recorded_by_user_id for r in rows_db if r.recorded_by_user_id}
         | {getattr(r, "closed_by_user_id", None) for r in rows_db if getattr(r, "closed_by_user_id", None)}
+        | {getattr(r, "published_by_user_id", None) for r in rows_db if getattr(r, "published_by_user_id", None)}
     )
     wh_ids = {r.warehouse_id for r in rows_db if r.warehouse_id}
     users = {u.id: u for u in db.query(User).filter(User.id.in_(list(user_ids))).all()} if user_ids else {}
     whs = {w.id: w.name for w in db.query(Warehouse).filter(Warehouse.id.in_(list(wh_ids))).all()} if wh_ids else {}
+
+    taken_idx = _enrich_withholding_taken_from_notes(
+        db, rows_db, _withholding_taken_from_reports_index(db)
+    )
+    linked_ids = {
+        int(getattr(r, "linked_report_id"))
+        for r in rows_db
+        if getattr(r, "linked_report_id", None)
+    }
+    linked_reports = {
+        int(rep.id): rep
+        for rep in (
+            db.query(DailyReport).filter(DailyReport.id.in_(list(linked_ids))).all()
+            if linked_ids
+            else []
+        )
+    }
 
     out: list[ManualWithholdingItem] = []
     for r in rows_db:
         usr = users.get(r.user_id)
         rec = users.get(r.recorded_by_user_id) if r.recorded_by_user_id else None
         clo = users.get(getattr(r, "closed_by_user_id", None)) if getattr(r, "closed_by_user_id", None) else None
-        user_name = (usr.last_name or usr.first_name or usr.username) if usr else f"ID {r.user_id}"
-        recorded_by_name = (rec.last_name or rec.first_name or rec.username) if rec else None
+        pub = users.get(getattr(r, "published_by_user_id", None)) if getattr(r, "published_by_user_id", None) else None
+        linked_rep = None
+        lid = getattr(r, "linked_report_id", None)
+        if lid is not None:
+            try:
+                linked_rep = linked_reports.get(int(lid))
+            except (TypeError, ValueError):
+                linked_rep = None
+        taken_amt, taken_rid, taken_at = _taken_fields_for_withholding(
+            r, auto_taken=taken_idx.get(int(r.id)), linked_report=linked_rep
+        )
         out.append(
-            ManualWithholdingItem(
-                id=r.id,
-                created_at=r.created_at,
-                user_id=r.user_id,
-                user_name=user_name,
-                amount=float(r.amount or 0),
-                warehouse_id=r.warehouse_id,
+            _manual_withholding_to_item(
+                r,
+                user_name=_user_short_name(usr, f"ID {r.user_id}"),
                 warehouse_name=whs.get(r.warehouse_id) if r.warehouse_id else None,
-                report_month=r.report_month,
-                reason=r.reason,
-                note=r.note,
-                recorded_by_user_id=r.recorded_by_user_id,
-                recorded_by_name=recorded_by_name,
-                closed=bool(getattr(r, "closed", False)),
-                closed_at=getattr(r, "closed_at", None),
-                closed_by_user_id=getattr(r, "closed_by_user_id", None),
-                closed_by_name=(clo.last_name or clo.first_name or clo.username) if clo else None,
+                recorded_by_name=_user_short_name(rec) if rec else None,
+                closed_by_name=_user_short_name(clo) if clo else None,
+                published_by_name=_user_short_name(pub) if pub else None,
+                taken_in_report=taken_amt,
+                taken_report_id=taken_rid,
+                taken_report_at=taken_at,
             )
         )
     return ManualWithholdingResponse(rows=out)
@@ -2754,6 +3159,7 @@ def create_withholding_manual(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_admin_user),
 ):
+    """Создаёт черновик удержания: в журнале админа есть, в ЛК сотрудника — после «Отправить в ЛК»."""
     user = db.query(User).filter(User.id == int(data.user_id), User.is_active == True).first()
     if not user:
         raise HTTPException(status_code=400, detail="Сотрудник не найден или неактивен")
@@ -2763,6 +3169,9 @@ def create_withholding_manual(
         if not wh:
             raise HTTPException(status_code=400, detail="Точка не найдена")
         wh_name = wh.name
+    linked_rep = _validate_withholding_linked_report(
+        db, report_id=data.linked_report_id, user_id=int(data.user_id)
+    )
     obj = ManualWithholding(
         user_id=int(data.user_id),
         amount=float(data.amount),
@@ -2771,29 +3180,25 @@ def create_withholding_manual(
         reason=(data.reason or "").strip() or None,
         note=(data.note or "").strip() or None,
         recorded_by_user_id=current_user.id,
+        published_to_lk=False,
+        published_at=None,
+        published_by_user_id=None,
+        linked_report_id=int(linked_rep.id) if linked_rep is not None else None,
     )
     db.add(obj)
     db.commit()
     db.refresh(obj)
-    user_name = user.last_name or user.first_name or user.username
-    rec_name = current_user.last_name or current_user.first_name or current_user.username
-    return ManualWithholdingItem(
-        id=obj.id,
-        created_at=obj.created_at,
-        user_id=obj.user_id,
-        user_name=user_name,
-        amount=float(obj.amount or 0),
-        warehouse_id=obj.warehouse_id,
+    taken_amt, taken_rid, taken_at = _taken_fields_for_withholding(
+        obj, auto_taken=None, linked_report=linked_rep
+    )
+    return _manual_withholding_to_item(
+        obj,
+        user_name=_user_short_name(user),
         warehouse_name=wh_name,
-        report_month=obj.report_month,
-        reason=obj.reason,
-        note=obj.note,
-        recorded_by_user_id=obj.recorded_by_user_id,
-        recorded_by_name=rec_name,
-        closed=bool(getattr(obj, "closed", False)),
-        closed_at=getattr(obj, "closed_at", None),
-        closed_by_user_id=getattr(obj, "closed_by_user_id", None),
-        closed_by_name=None,
+        recorded_by_name=_user_short_name(current_user),
+        taken_in_report=taken_amt,
+        taken_report_id=taken_rid,
+        taken_report_at=taken_at,
     )
 
 
@@ -2827,7 +3232,6 @@ def update_withholding_manual(
             if not wh:
                 raise HTTPException(status_code=400, detail="Точка не найдена")
             obj.warehouse_id = int(data.warehouse_id)
-    # Если warehouse_id не передали — оставляем как было.
 
     if data.report_month is not None:
         obj.report_month = (data.report_month or "").strip() or None
@@ -2835,6 +3239,20 @@ def update_withholding_manual(
         obj.reason = (data.reason or "").strip() or None
     if data.note is not None:
         obj.note = (data.note or "").strip() or None
+
+    linked_rep = None
+    fields_set = getattr(data, "model_fields_set", None) or getattr(data, "__fields_set__", set())
+    if "linked_report_id" in fields_set:
+        if data.linked_report_id is None or int(data.linked_report_id) <= 0:
+            obj.linked_report_id = None
+            linked_rep = None
+        else:
+            linked_rep = _validate_withholding_linked_report(
+                db, report_id=int(data.linked_report_id), user_id=int(obj.user_id)
+            )
+            obj.linked_report_id = int(linked_rep.id) if linked_rep is not None else None
+    elif getattr(obj, "linked_report_id", None):
+        linked_rep = db.query(DailyReport).filter(DailyReport.id == int(obj.linked_report_id)).first()
 
     db.add(obj)
     db.commit()
@@ -2844,26 +3262,111 @@ def update_withholding_manual(
     if obj.warehouse_id:
         wh = db.query(Warehouse).filter(Warehouse.id == int(obj.warehouse_id)).first()
         wh_name = wh.name if wh else None
-    user_name = (user.last_name or user.first_name or user.username) if user else f"ID {obj.user_id}"
-    rec_name = current_user.last_name or current_user.first_name or current_user.username
-    return ManualWithholdingItem(
-        id=obj.id,
-        created_at=obj.created_at,
-        user_id=obj.user_id,
-        user_name=user_name,
-        amount=float(obj.amount or 0),
-        warehouse_id=obj.warehouse_id,
-        warehouse_name=wh_name,
-        report_month=obj.report_month,
-        reason=obj.reason,
-        note=obj.note,
-        recorded_by_user_id=obj.recorded_by_user_id,
-        recorded_by_name=rec_name,
-        closed=bool(getattr(obj, "closed", False)),
-        closed_at=getattr(obj, "closed_at", None),
-        closed_by_user_id=getattr(obj, "closed_by_user_id", None),
-        closed_by_name=None,
+    pub = (
+        db.query(User).filter(User.id == int(obj.published_by_user_id)).first()
+        if getattr(obj, "published_by_user_id", None)
+        else None
     )
+    clo = (
+        db.query(User).filter(User.id == int(obj.closed_by_user_id)).first()
+        if getattr(obj, "closed_by_user_id", None)
+        else None
+    )
+    taken_amt, taken_rid, taken_at = _taken_fields_for_withholding(
+        obj, auto_taken=None, linked_report=linked_rep
+    )
+    return _manual_withholding_to_item(
+        obj,
+        user_name=_user_short_name(user, f"ID {obj.user_id}"),
+        warehouse_name=wh_name,
+        recorded_by_name=_user_short_name(current_user),
+        closed_by_name=_user_short_name(clo) if clo else None,
+        published_by_name=_user_short_name(pub) if pub else None,
+        taken_in_report=taken_amt,
+        taken_report_id=taken_rid,
+        taken_report_at=taken_at,
+    )
+
+
+@router.post("/withholding/manual/{item_id}/publish", response_model=ManualWithholdingItem)
+def publish_withholding_manual(
+    item_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """Отправить удержание в ЛК сотрудника (появится в блоке «Удержания» отчёта)."""
+    obj = db.query(ManualWithholding).filter(ManualWithholding.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Запись удержания не найдена")
+    _publish_withholding_row(obj, current_user)
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    usr = db.query(User).filter(User.id == int(obj.user_id)).first()
+    wh = db.query(Warehouse).filter(Warehouse.id == int(obj.warehouse_id)).first() if obj.warehouse_id else None
+    clo = (
+        db.query(User).filter(User.id == int(obj.closed_by_user_id)).first()
+        if getattr(obj, "closed_by_user_id", None)
+        else None
+    )
+    return _manual_withholding_to_item(
+        obj,
+        user_name=_user_short_name(usr, f"ID {obj.user_id}"),
+        warehouse_name=wh.name if wh else None,
+        recorded_by_name=_user_short_name(current_user),
+        closed_by_name=_user_short_name(clo) if clo else None,
+        published_by_name=_user_short_name(current_user),
+    )
+
+
+@router.post("/withholding/manual/publish-bulk", response_model=ManualWithholdingResponse)
+def publish_withholding_manual_bulk(
+    data: ManualWithholdingPublishBulkBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """Массовая отправка удержаний в ЛК."""
+    ids = sorted({int(x) for x in (data.ids or []) if int(x) > 0})
+    if not ids:
+        raise HTTPException(status_code=400, detail="Укажите id удержаний")
+    rows = db.query(ManualWithholding).filter(ManualWithholding.id.in_(ids)).all()
+    found = {r.id for r in rows}
+    missing = [i for i in ids if i not in found]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Не найдены удержания: {', '.join(map(str, missing))}")
+    for obj in rows:
+        _publish_withholding_row(obj, current_user)
+        db.add(obj)
+    db.commit()
+    for obj in rows:
+        db.refresh(obj)
+
+    user_ids = (
+        {r.user_id for r in rows if r.user_id}
+        | {r.recorded_by_user_id for r in rows if r.recorded_by_user_id}
+        | {getattr(r, "closed_by_user_id", None) for r in rows if getattr(r, "closed_by_user_id", None)}
+        | {getattr(r, "published_by_user_id", None) for r in rows if getattr(r, "published_by_user_id", None)}
+    )
+    wh_ids = {r.warehouse_id for r in rows if r.warehouse_id}
+    users = {u.id: u for u in db.query(User).filter(User.id.in_(list(user_ids))).all()} if user_ids else {}
+    whs = {w.id: w.name for w in db.query(Warehouse).filter(Warehouse.id.in_(list(wh_ids))).all()} if wh_ids else {}
+    out: list[ManualWithholdingItem] = []
+    for r in sorted(rows, key=lambda x: (-(x.created_at.timestamp() if x.created_at else 0), -x.id)):
+        usr = users.get(r.user_id)
+        rec = users.get(r.recorded_by_user_id) if r.recorded_by_user_id else None
+        clo = users.get(getattr(r, "closed_by_user_id", None)) if getattr(r, "closed_by_user_id", None) else None
+        pub = users.get(getattr(r, "published_by_user_id", None)) if getattr(r, "published_by_user_id", None) else None
+        out.append(
+            _manual_withholding_to_item(
+                r,
+                user_name=_user_short_name(usr, f"ID {r.user_id}"),
+                warehouse_name=whs.get(r.warehouse_id) if r.warehouse_id else None,
+                recorded_by_name=_user_short_name(rec) if rec else None,
+                closed_by_name=_user_short_name(clo) if clo else None,
+                published_by_name=_user_short_name(pub) if pub else None,
+            )
+        )
+    return ManualWithholdingResponse(rows=out)
 
 
 @router.post("/withholding/manual/{item_id}/close", response_model=ManualWithholdingItem)
@@ -2884,25 +3387,18 @@ def close_withholding_manual(
 
     usr = db.query(User).filter(User.id == int(obj.user_id)).first()
     wh = db.query(Warehouse).filter(Warehouse.id == int(obj.warehouse_id)).first() if obj.warehouse_id else None
-    user_name = (usr.last_name or usr.first_name or usr.username) if usr else f"ID {obj.user_id}"
-    rec_name = current_user.last_name or current_user.first_name or current_user.username
-    return ManualWithholdingItem(
-        id=obj.id,
-        created_at=obj.created_at,
-        user_id=obj.user_id,
-        user_name=user_name,
-        amount=float(obj.amount or 0),
-        warehouse_id=obj.warehouse_id,
+    pub = (
+        db.query(User).filter(User.id == int(obj.published_by_user_id)).first()
+        if getattr(obj, "published_by_user_id", None)
+        else None
+    )
+    return _manual_withholding_to_item(
+        obj,
+        user_name=_user_short_name(usr, f"ID {obj.user_id}"),
         warehouse_name=wh.name if wh else None,
-        report_month=obj.report_month,
-        reason=obj.reason,
-        note=obj.note,
-        recorded_by_user_id=obj.recorded_by_user_id,
-        recorded_by_name=rec_name,
-        closed=True,
-        closed_at=obj.closed_at,
-        closed_by_user_id=obj.closed_by_user_id,
-        closed_by_name=rec_name,
+        recorded_by_name=_user_short_name(current_user),
+        closed_by_name=_user_short_name(current_user),
+        published_by_name=_user_short_name(pub) if pub else None,
     )
 
 
@@ -2924,25 +3420,17 @@ def reopen_withholding_manual(
 
     usr = db.query(User).filter(User.id == int(obj.user_id)).first()
     wh = db.query(Warehouse).filter(Warehouse.id == int(obj.warehouse_id)).first() if obj.warehouse_id else None
-    user_name = (usr.last_name or usr.first_name or usr.username) if usr else f"ID {obj.user_id}"
-    rec_name = current_user.last_name or current_user.first_name or current_user.username
-    return ManualWithholdingItem(
-        id=obj.id,
-        created_at=obj.created_at,
-        user_id=obj.user_id,
-        user_name=user_name,
-        amount=float(obj.amount or 0),
-        warehouse_id=obj.warehouse_id,
+    pub = (
+        db.query(User).filter(User.id == int(obj.published_by_user_id)).first()
+        if getattr(obj, "published_by_user_id", None)
+        else None
+    )
+    return _manual_withholding_to_item(
+        obj,
+        user_name=_user_short_name(usr, f"ID {obj.user_id}"),
         warehouse_name=wh.name if wh else None,
-        report_month=obj.report_month,
-        reason=obj.reason,
-        note=obj.note,
-        recorded_by_user_id=obj.recorded_by_user_id,
-        recorded_by_name=rec_name,
-        closed=False,
-        closed_at=None,
-        closed_by_user_id=None,
-        closed_by_name=None,
+        recorded_by_name=_user_short_name(current_user),
+        published_by_name=_user_short_name(pub) if pub else None,
     )
 
 
